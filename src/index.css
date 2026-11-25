@@ -1,0 +1,132 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+@layer base {
+  :root {
+    --font-display: 'Plus Jakarta Sans', system-ui, sans-serif;
+    --font-body: 'DM Sans', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    font-family: var(--font-body);
+    background-color: #FAF9F6;
+    color: #111B21;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono {
+    font-family: var(--font-mono);
+  }
+
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    outline: 2px solid #008069;
+    outline-offset: 2px;
+  }
+}
+
+:root {
+  --app-header-h: 3.5rem;
+  --mobile-nav-h: 4rem;
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+html,
+body {
+  overflow-x: clip;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.mobile-safe-wrap {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.conversation-canvas {
+  background-color: #F3F0EA;
+  background-image: radial-gradient(rgba(17, 27, 33, 0.04) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+/* Ensure Leaflet map tiles and controls sit cleanly below modals */
+.leaflet-container {
+  font-family: var(--font-body);
+  z-index: 10;
+}
+
+@media (max-width: 767px) {
+  .app-main-shell {
+    padding-bottom: calc(var(--mobile-nav-h) + var(--safe-bottom) + 0.5rem);
+  }
+
+  .app-main-shell--chats {
+    padding-bottom: calc(var(--mobile-nav-h) + var(--safe-bottom));
+  }
+
+  .mobile-bottom-nav {
+    height: calc(var(--mobile-nav-h) + var(--safe-bottom));
+    padding-bottom: var(--safe-bottom);
+  }
+
+  .mobile-chats-frame {
+    height: calc(100dvh - var(--app-header-h) - var(--mobile-nav-h) - var(--safe-bottom));
+    min-height: 24rem;
+  }
+
+  .mobile-toast {
+    bottom: calc(var(--mobile-nav-h) + var(--safe-bottom) + 0.75rem);
+  }
+}
+
+@media (pointer: coarse), (max-width: 767px) {
+  input[type="range"].touch-slider {
+    min-height: 44px;
+    cursor: pointer;
+  }
+
+  input[type="range"].touch-slider::-webkit-slider-thumb {
+    width: 24px;
+    height: 24px;
+  }
+
+  input[type="range"].touch-slider::-moz-range-thumb {
+    width: 24px;
+    height: 24px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

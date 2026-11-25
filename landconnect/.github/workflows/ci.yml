@@ -1,0 +1,23 @@
+name: LandConnect CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install backend dependencies
+        run: pip install -r landconnect/backend/requirements.txt
+      - name: Compile Python modules
+        run: find landconnect/backend -name "*.py" -print0 | xargs -0 python -m py_compile
+      - name: Run pytest suite
+        working-directory: landconnect/backend
+        run: pytest -v

@@ -1,0 +1,6 @@
+{
+  "name": "LandConnect",
+  "description": "Privacy-first real estate land marketplace with WhatsApp-inspired messaging, PostGIS geospatial search, and WebRTC audio/video calling.",
+  "requestFramePermissions": ["camera", "microphone", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

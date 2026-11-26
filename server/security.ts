@@ -42,6 +42,19 @@ export function hashPassword(password: string): string {
   return `scrypt$${salt}$${derived}`;
 }
 
+export function hashPasswordAsync(password: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const salt = crypto.randomBytes(16).toString('hex');
+    crypto.scrypt(password, salt, 64, (err, derived) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(`scrypt$${salt}$${derived.toString('hex')}`);
+    });
+  });
+}
+
 export function verifyPassword(password: string, storedHash: string): boolean {
   const parts = storedHash.split('$');
   if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
@@ -50,6 +63,29 @@ export function verifyPassword(password: string, storedHash: string): boolean {
   const original = Buffer.from(originalHex, 'hex');
   if (derived.length !== original.length) return false;
   return crypto.timingSafeEqual(derived, original);
+}
+
+export function verifyPasswordAsync(password: string, storedHash: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const parts = storedHash.split('$');
+    if (parts.length !== 3 || parts[0] !== 'scrypt') {
+      resolve(false);
+      return;
+    }
+    const [, salt, originalHex] = parts;
+    const original = Buffer.from(originalHex, 'hex');
+    crypto.scrypt(password, salt, 64, (err, derived) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      if (derived.length !== original.length) {
+        resolve(false);
+        return;
+      }
+      resolve(crypto.timingSafeEqual(derived, original));
+    });
+  });
 }
 
 function base64UrlEncode(input: string | Buffer): string {
@@ -181,6 +217,7 @@ export function toPrivacySafeProfile(
  * Sliding-window in-memory rate limiter (mirrors Redis ZREMRANGEBYSCORE + ZCARD pattern).
  */
 export class SlidingWindowRateLimiter {
+  private static readonly MAX_BUCKETS = 20_000;
   private buckets = new Map<string, number[]>();
   private lastPruneMs = Date.now();
 
@@ -191,6 +228,15 @@ export class SlidingWindowRateLimiter {
     for (const [key, list] of this.buckets.entries()) {
       if (list.length === 0 || list[list.length - 1] <= cutoff) {
         this.buckets.delete(key);
+      }
+    }
+    if (this.buckets.size > SlidingWindowRateLimiter.MAX_BUCKETS) {
+      const overflow = this.buckets.size - SlidingWindowRateLimiter.MAX_BUCKETS;
+      let removed = 0;
+      for (const key of this.buckets.keys()) {
+        this.buckets.delete(key);
+        removed += 1;
+        if (removed >= overflow) break;
       }
     }
   }
@@ -208,11 +254,13 @@ export class SlidingWindowRateLimiter {
     if (timestamps.length >= maxRequests) {
       const oldest = timestamps[0];
       const retryAfterSec = Math.max(1, Math.ceil((oldest + windowMs - now) / 1000));
+      this.buckets.delete(key);
       this.buckets.set(key, timestamps);
       return { allowed: false, remaining: 0, retryAfterSec };
     }
 
     timestamps.push(now);
+    this.buckets.delete(key);
     this.buckets.set(key, timestamps);
     return {
       allowed: true,

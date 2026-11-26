@@ -450,3 +450,309 @@ test('Privacy consent masking and real-time 2-tab WS chat + call signaling work 
   assert.equal(reconciled?.state, 'MISSED');
   assert.equal(reconciled?.end_reason, 'server_restart');
 });
+
+test('Enterprise upgrades: pagination, Deal Room PDF attachments, blocking, reporting, profile/password updates, and env-gated controls', async () => {
+  // 1. Pagination metadata
+  const page1 = await apiJson<{
+    count: number;
+    total: number;
+    limit: number;
+    offset: number;
+    has_more: boolean;
+    listings: Array<{ id: string }>;
+  }>('/api/v1/public/listings?limit=4&offset=0');
+  assert.equal(page1.status, 200);
+  assert.equal(page1.body.count, 4);
+  assert.equal(page1.body.limit, 4);
+  assert.equal(page1.body.offset, 0);
+  assert.ok(page1.body.total >= 11);
+  assert.equal(page1.body.has_more, true);
+
+  // 2. Register two independent accounts and test profile + password updates
+  const p1 = await apiJson<{
+    access_token: string;
+    user: { user_uuid: string; display_name: string };
+  }>('/api/v1/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      email: 'ananya.buyer@landconnect.in',
+      password: 'Password#1234',
+      display_name: 'Ananya Rao',
+      role: 'BUYER',
+      city: 'Bengaluru',
+    }),
+  });
+  assert.equal(p1.status, 201);
+
+  const p2 = await apiJson<{
+    access_token: string;
+    user: { user_uuid: string };
+  }>('/api/v1/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({
+      email: 'suresh.seller@landconnect.in',
+      password: 'Password#1234',
+      display_name: 'Suresh Gowda',
+      role: 'SELLER',
+      city: 'Mysuru',
+    }),
+  });
+  assert.equal(p2.status, 201);
+
+  const profPatch = await apiJson<{ display_name: string; city: string }>('/api/v1/auth/profile', {
+    method: 'PATCH',
+    token: p1.body.access_token,
+    body: JSON.stringify({ display_name: 'Ananya K. Rao', city: 'Mysuru', bio: 'Agricultural investor' }),
+  });
+  assert.equal(profPatch.status, 200);
+  assert.equal(profPatch.body.display_name, 'Ananya K. Rao');
+  assert.equal(profPatch.body.city, 'Mysuru');
+
+  const pwBad = await apiJson('/api/v1/auth/change-password', {
+    method: 'POST',
+    token: p1.body.access_token,
+    body: JSON.stringify({ current_password: 'WrongPassword', new_password: 'NewStrongPassword#99' }),
+  });
+  assert.equal(pwBad.status, 401);
+
+  const pwOk = await apiJson('/api/v1/auth/change-password', {
+    method: 'POST',
+    token: p1.body.access_token,
+    body: JSON.stringify({ current_password: 'Password#1234', new_password: 'NewStrongPassword#99' }),
+  });
+  assert.equal(pwOk.status, 200);
+
+  const loginNewPw = await apiJson('/api/v1/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email: 'ananya.buyer@landconnect.in', password: 'NewStrongPassword#99' }),
+  });
+  assert.equal(loginNewPw.status, 200);
+
+  // 3. Deal Room PDF attachment magic-byte check & persistence
+  const sellerCreate = await apiJson<{ id: string }>('/api/v1/listings', {
+    method: 'POST',
+    token: p2.body.access_token,
+    body: JSON.stringify({
+      title: 'Hunsur Organic Estate Plot',
+      price_inr: 6500000,
+      area_sqft: 21780,
+      land_type: 'AGRICULTURAL',
+      latitude: 12.305,
+      longitude: 76.288,
+    }),
+  });
+  assert.equal(sellerCreate.status, 201);
+
+  const directRoom = await apiJson<{ id: string }>('/api/v1/chats/direct', {
+    method: 'POST',
+    token: p1.body.access_token,
+    body: JSON.stringify({ listing_id: sellerCreate.body.id, peer_uuid: p2.body.user.user_uuid }),
+  });
+  assert.equal(directRoom.status, 201);
+
+  const badPdf = await apiJson(`/api/v1/chats/${directRoom.body.id}/attachments`, {
+    method: 'POST',
+    token: p2.body.access_token,
+    body: JSON.stringify({
+      filename: 'spoof.pdf',
+      data_url: `data:application/pdf;base64,${Buffer.from('NOT_A_PDF_FILE').toString('base64')}`,
+    }),
+  });
+  assert.equal(badPdf.status, 400);
+
+  const validPdfBytes = Buffer.from('%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n', 'ascii');
+  const okPdf = await apiJson<{ attachment_url: string; attachment_name: string; attachment_type: string }>(
+    `/api/v1/chats/${directRoom.body.id}/attachments`,
+    {
+      method: 'POST',
+      token: p2.body.access_token,
+      body: JSON.stringify({
+        filename: 'bhoomi-rtc.pdf',
+        data_url: `data:application/pdf;base64,${validPdfBytes.toString('base64')}`,
+        body: 'Latest Bhoomi RTC extract attached',
+      }),
+    },
+  );
+  assert.equal(okPdf.status, 201);
+  assert.ok(okPdf.body.attachment_url.startsWith('/uploads/attachments/'));
+  assert.equal(okPdf.body.attachment_name, 'bhoomi-rtc.pdf');
+  assert.equal(okPdf.body.attachment_type, 'application/pdf');
+
+  // 4. Listing report & User blocking enforcement on messages and calls
+  const reportRes = await apiJson<{ id: string; listing_id: string }>(
+    `/api/v1/listings/${sellerCreate.body.id}/report`,
+    {
+      method: 'POST',
+      token: p1.body.access_token,
+      body: JSON.stringify({ reason: 'Incorrect coordinates or zoning', details: 'Check boundary' }),
+    },
+  );
+  assert.equal(reportRes.status, 201);
+  assert.equal(reportRes.body.listing_id, sellerCreate.body.id);
+
+  const blockRes = await apiJson('/api/v1/users/' + p1.body.user.user_uuid + '/block', {
+    method: 'POST',
+    token: p2.body.access_token,
+    body: JSON.stringify({ reason: 'Test block' }),
+  });
+  assert.equal(blockRes.status, 201);
+
+  const msgBlocked = await apiJson(`/api/v1/chats/${directRoom.body.id}/messages`, {
+    method: 'POST',
+    token: p1.body.access_token,
+    body: JSON.stringify({ body: 'Can you hear me?' }),
+  });
+  assert.equal(msgBlocked.status, 403);
+
+  const callBlocked = await apiJson('/api/v1/calls/initiate', {
+    method: 'POST',
+    token: p1.body.access_token,
+    body: JSON.stringify({ room_id: directRoom.body.id, mode: 'AUDIO' }),
+  });
+  assert.equal(callBlocked.status, 403);
+
+  await apiJson('/api/v1/users/' + p1.body.user.user_uuid + '/block', {
+    method: 'DELETE',
+    token: p2.body.access_token,
+  });
+
+  const msgAfterUnblock = await apiJson(`/api/v1/chats/${directRoom.body.id}/messages`, {
+    method: 'POST',
+    token: p1.body.access_token,
+    body: JSON.stringify({ body: 'Unblocked follow-up message' }),
+  });
+  assert.equal(msgAfterUnblock.status, 201);
+
+  // 5. Env-gated demo auth & metrics bearer token + grounding cache store
+  store.setGroundingCache(sellerCreate.body.id, 'highway', {
+    listing_id: sellerCreate.body.id,
+    search_summary: 'Cached highway insight',
+  });
+  const cachedHit = store.getGroundingCache(sellerCreate.body.id, 'highway', 12);
+  assert.equal(cachedHit?.search_summary, 'Cached highway insight');
+
+  const prevDemo = process.env.ENABLE_DEMO_AUTH;
+  const prevMetrics = process.env.METRICS_TOKEN;
+  try {
+    process.env.ENABLE_DEMO_AUTH = 'false';
+    process.env.METRICS_TOKEN = 'secret-prom-token';
+
+    const pubCfg = await apiJson<{ demoAuthEnabled: boolean }>('/api/v1/config/public');
+    assert.equal(pubCfg.status, 200);
+    assert.equal(pubCfg.body.demoAuthEnabled, false);
+
+    const demoBlocked = await apiJson('/api/v1/auth/demo-login', {
+      method: 'POST',
+      body: JSON.stringify({ role: 'BUYER' }),
+    });
+    assert.equal(demoBlocked.status, 403);
+
+    const metricsUnauth = await fetch(`${baseUrl}/metrics`);
+    assert.equal(metricsUnauth.status, 401);
+
+    const metricsAuth = await fetch(`${baseUrl}/metrics`, {
+      headers: { Authorization: 'Bearer secret-prom-token' },
+    });
+    assert.equal(metricsAuth.status, 200);
+  } finally {
+    if (prevDemo === undefined) delete process.env.ENABLE_DEMO_AUTH;
+    else process.env.ENABLE_DEMO_AUTH = prevDemo;
+    if (prevMetrics === undefined) delete process.env.METRICS_TOKEN;
+    else process.env.METRICS_TOKEN = prevMetrics;
+  }
+});
+
+test('Scalability suite: probes, wire-level gzip, FTS5 search, paginated users, and batch hydration', async () => {
+  // 1. Liveness & readiness probes
+  const live = await apiJson<{ status: string; uptime_sec: number }>('/health/live');
+  assert.equal(live.status, 200);
+  assert.equal(live.body.status, 'alive');
+  assert.equal(typeof live.body.uptime_sec, 'number');
+
+  const ready = await apiJson<{ status: string; journal_mode: string }>('/health/ready');
+  assert.equal(ready.status, 200);
+  assert.equal(ready.body.status, 'ready');
+  assert.equal(ready.body.journal_mode, 'wal');
+
+  // Verify /health/ready returns 503 when draining
+  let draining = true;
+  const drainApp = createLandConnectApp({ store, callEngine: engine, uploadsDir, isShuttingDown: () => draining });
+  const drainServer = http.createServer(drainApp.app);
+  await new Promise<void>((resolve) => drainServer.listen(0, '127.0.0.1', () => resolve()));
+  const drainAddr = drainServer.address();
+  assert(drainAddr && typeof drainAddr === 'object');
+  const drainRes = await fetch(`http://127.0.0.1:${drainAddr.port}/health/ready`);
+  assert.equal(drainRes.status, 503);
+  draining = false;
+  const readyAgainRes = await fetch(`http://127.0.0.1:${drainAddr.port}/health/ready`);
+  assert.equal(readyAgainRes.status, 200);
+  await new Promise<void>((resolve) => drainServer.close(() => resolve()));
+
+  // 2. Wire-level gzip compression + Cache-Control on /api/v1/public/listings
+  const zlib = await import('node:zlib');
+  const rawGzip = await new Promise<{ statusCode: number; headers: http.IncomingHttpHeaders; body: Buffer }>((resolve, reject) => {
+    const req = http.get(
+      `${baseUrl}/api/v1/public/listings?limit=24`,
+      { headers: { 'Accept-Encoding': 'gzip' } },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () =>
+          resolve({ statusCode: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks) }),
+        );
+      },
+    );
+    req.on('error', reject);
+  });
+  assert.equal(rawGzip.statusCode, 200);
+  assert.equal(rawGzip.headers['content-encoding'], 'gzip');
+  assert.match(String(rawGzip.headers['cache-control'] || ''), /public, max-age=60/);
+  const decompressed = JSON.parse(zlib.gunzipSync(rawGzip.body).toString('utf8')) as {
+    listings: Array<{ id: string }>;
+  };
+  assert.ok(decompressed.listings.length >= 11);
+
+  // 3. FTS5 search & paginated directory + batch chat/call hydration
+  const buyerLogin = (
+    await apiJson<{ access_token: string }>('/api/v1/auth/demo-login', {
+      method: 'POST',
+      body: JSON.stringify({ role: 'BUYER' }),
+    })
+  ).body;
+
+  const ftsRes = await apiJson<{ listings: Array<{ id: string; title: string }> }>(
+    '/api/v1/listings?q=Airport',
+    { token: buyerLogin.access_token },
+  );
+  assert.equal(ftsRes.status, 200);
+  assert.ok(ftsRes.body.listings.some((l) => l.title.includes('Airport')));
+
+  const usersPage = await apiJson<{
+    users: Array<{ user_uuid: string }>;
+    total: number;
+    limit: number;
+    offset: number;
+    has_more: boolean;
+  }>('/api/v1/users?limit=2&offset=0', { token: buyerLogin.access_token });
+  assert.equal(usersPage.status, 200);
+  assert.equal(usersPage.body.users.length, 2);
+  assert.equal(usersPage.body.limit, 2);
+  assert.equal(usersPage.body.offset, 0);
+  assert.ok(usersPage.body.total >= 4);
+  assert.equal(usersPage.body.has_more, true);
+
+  const chatsRes = await apiJson<{
+    chats: Array<{ id: string; participants: Array<{ user_uuid: string }>; unread_count: number }>;
+  }>('/api/v1/chats', { token: buyerLogin.access_token });
+  assert.equal(chatsRes.status, 200);
+  assert.ok(chatsRes.body.chats.length >= 2);
+  assert.ok(chatsRes.body.chats.every((c) => c.participants.length >= 2));
+
+  const callsLogsRes = await apiJson<{
+    logs: Array<{ call_id: string; caller_profile: { user_uuid: string } | null }>;
+  }>('/api/v1/calls/logs', { token: buyerLogin.access_token });
+  assert.equal(callsLogsRes.status, 200);
+  assert.ok(callsLogsRes.body.logs.length >= 1);
+  assert.ok(callsLogsRes.body.logs.every((l) => l.caller_profile !== null));
+});
+

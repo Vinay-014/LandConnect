@@ -67,6 +67,16 @@ export function verifyImageMagicBytes(buf: Buffer, ext: 'png' | 'jpg' | 'webp'):
   return false;
 }
 
+export function verifyAttachmentMagicBytes(
+  buf: Buffer,
+  ext: 'png' | 'jpg' | 'webp' | 'pdf',
+): boolean {
+  if (ext === 'pdf') {
+    return buf.length >= 5 && buf.subarray(0, 5).toString('ascii') === '%PDF-';
+  }
+  return verifyImageMagicBytes(buf, ext);
+}
+
 export function clampString(value: unknown, maxLen: number, fallback = ''): string {
   if (typeof value !== 'string') return fallback;
   return value.trim().slice(0, maxLen);

@@ -12,6 +12,7 @@ import type {
   IdempotencyRecord,
   LandListing,
   LandType,
+  ListingReport,
   MessageDeliveryState,
   UserRecord,
   UserRole,
@@ -88,6 +89,9 @@ interface ChatMessageRow {
   sender_uuid: string;
   message_type: string;
   body: string;
+  attachment_url: string | null;
+  attachment_name: string | null;
+  attachment_type: string | null;
   delivery_state: string;
   created_at: string;
 }
@@ -120,6 +124,7 @@ export class SqliteStore {
   private conn: DatabaseSync;
   public readonly dbPath: string;
   public readonly journalMode: string;
+  private hasFts5 = false;
 
   constructor(customPath?: string) {
     const targetPath =
@@ -143,6 +148,9 @@ export class SqliteStore {
       PRAGMA synchronous = NORMAL;
       PRAGMA foreign_keys = ON;
       PRAGMA busy_timeout = 5000;
+      PRAGMA temp_store = MEMORY;
+      PRAGMA cache_size = -16000;
+      PRAGMA mmap_size = 268435456;
     `);
     const modeRow = this.conn.prepare('PRAGMA journal_mode').get() as { journal_mode?: string } | undefined;
     this.journalMode = String(modeRow?.journal_mode || 'wal');
@@ -208,6 +216,7 @@ export class SqliteStore {
 
       CREATE INDEX IF NOT EXISTS idx_listings_coords ON listings(latitude, longitude);
       CREATE INDEX IF NOT EXISTS idx_listings_type_price ON listings(land_type, price_inr);
+      CREATE INDEX IF NOT EXISTS idx_listings_city_type_price ON listings(city, land_type, price_inr);
       CREATE INDEX IF NOT EXISTS idx_listings_owner ON listings(owner_uuid);
       CREATE INDEX IF NOT EXISTS idx_listings_updated ON listings(updated_at DESC);
 
@@ -235,6 +244,9 @@ export class SqliteStore {
         sender_uuid TEXT NOT NULL REFERENCES users(user_uuid) ON DELETE CASCADE,
         message_type TEXT NOT NULL CHECK(message_type IN ('TEXT', 'SYSTEM')),
         body TEXT NOT NULL,
+        attachment_url TEXT,
+        attachment_name TEXT,
+        attachment_type TEXT,
         delivery_state TEXT NOT NULL CHECK(delivery_state IN ('SENT', 'DELIVERED', 'READ')),
         created_at TEXT NOT NULL
       );
@@ -288,7 +300,87 @@ export class SqliteStore {
         created_at_ms INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at_ms);
+
+      CREATE TABLE IF NOT EXISTS grounding_cache (
+        listing_id TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+        focus_key TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (listing_id, focus_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_grounding_cache_time ON grounding_cache(created_at_ms);
+
+      CREATE TABLE IF NOT EXISTS user_blocks (
+        blocker_uuid TEXT NOT NULL REFERENCES users(user_uuid) ON DELETE CASCADE,
+        blocked_uuid TEXT NOT NULL REFERENCES users(user_uuid) ON DELETE CASCADE,
+        reason TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (blocker_uuid, blocked_uuid)
+      );
+      CREATE INDEX IF NOT EXISTS idx_user_blocks_blocked ON user_blocks(blocked_uuid, blocker_uuid);
+
+      CREATE TABLE IF NOT EXISTS listing_reports (
+        id TEXT PRIMARY KEY,
+        listing_id TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+        reporter_uuid TEXT NOT NULL REFERENCES users(user_uuid) ON DELETE CASCADE,
+        reason TEXT NOT NULL,
+        details TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_listing_reports_listing ON listing_reports(listing_id, created_at DESC);
     `);
+
+    const msgCols = this.conn.prepare('PRAGMA table_info(chat_messages)').all() as Array<{ name: string }>;
+    const existingMsgCols = new Set(msgCols.map((c) => c.name));
+    if (!existingMsgCols.has('attachment_url')) {
+      this.conn.exec('ALTER TABLE chat_messages ADD COLUMN attachment_url TEXT');
+    }
+    if (!existingMsgCols.has('attachment_name')) {
+      this.conn.exec('ALTER TABLE chat_messages ADD COLUMN attachment_name TEXT');
+    }
+    if (!existingMsgCols.has('attachment_type')) {
+      this.conn.exec('ALTER TABLE chat_messages ADD COLUMN attachment_type TEXT');
+    }
+
+    try {
+      const ftsExists = this.conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'listings_fts'")
+        .get();
+      this.conn.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS listings_fts USING fts5(
+          title,
+          locality,
+          city,
+          description,
+          zoning_status,
+          content='listings',
+          content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS listings_fts_ai AFTER INSERT ON listings BEGIN
+          INSERT INTO listings_fts(rowid, title, locality, city, description, zoning_status)
+          VALUES (new.rowid, new.title, new.locality, new.city, new.description, new.zoning_status);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS listings_fts_ad AFTER DELETE ON listings BEGIN
+          INSERT INTO listings_fts(listings_fts, rowid, title, locality, city, description, zoning_status)
+          VALUES ('delete', old.rowid, old.title, old.locality, old.city, old.description, old.zoning_status);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS listings_fts_au AFTER UPDATE ON listings BEGIN
+          INSERT INTO listings_fts(listings_fts, rowid, title, locality, city, description, zoning_status)
+          VALUES ('delete', old.rowid, old.title, old.locality, old.city, old.description, old.zoning_status);
+          INSERT INTO listings_fts(rowid, title, locality, city, description, zoning_status)
+          VALUES (new.rowid, new.title, new.locality, new.city, new.description, new.zoning_status);
+        END;
+      `);
+      if (!ftsExists) {
+        this.conn.exec("INSERT INTO listings_fts(listings_fts) VALUES('rebuild')");
+      }
+      this.hasFts5 = true;
+    } catch {
+      this.hasFts5 = false;
+    }
   }
 
   public withTransaction<T>(fn: () => T): T {
@@ -1234,6 +1326,50 @@ export class SqliteStore {
     return row ? this.hydrateUserRow(row) : undefined;
   }
 
+  findUsersByUuids(uuids: string[]): Map<string, UserRecord> {
+    const unique = Array.from(new Set(uuids.filter(Boolean)));
+    const result = new Map<string, UserRecord>();
+    if (unique.length === 0) return result;
+
+    const placeholders = unique.map(() => '?').join(',');
+    const rows = this.conn
+      .prepare(`SELECT * FROM users WHERE user_uuid IN (${placeholders})`)
+      .all(...unique) as unknown as UserRow[];
+
+    const consentRows = this.conn
+      .prepare(`SELECT owner_uuid, peer_uuid FROM user_contact_consents WHERE owner_uuid IN (${placeholders})`)
+      .all(...unique) as Array<{ owner_uuid: string; peer_uuid: string }>;
+
+    const consentsByOwner = new Map<string, string[]>();
+    for (const c of consentRows) {
+      let arr = consentsByOwner.get(c.owner_uuid);
+      if (!arr) {
+        arr = [];
+        consentsByOwner.set(c.owner_uuid, arr);
+      }
+      arr.push(c.peer_uuid);
+    }
+
+    for (const row of rows) {
+      result.set(row.user_uuid, {
+        user_uuid: row.user_uuid,
+        email: row.email,
+        phone: row.phone,
+        password_hash: row.password_hash,
+        display_name: row.display_name,
+        role: row.role as UserRole,
+        city: row.city,
+        bio: row.bio,
+        allow_calls: Boolean(row.allow_calls),
+        show_contact_after_consent: Boolean(row.show_contact_after_consent),
+        consented_peer_uuids: consentsByOwner.get(row.user_uuid) ?? [],
+        is_demo: Boolean(row.is_demo),
+        created_at: row.created_at,
+      });
+    }
+    return result;
+  }
+
   findDemoUserByRole(role: UserRole): UserRecord | undefined {
     const row = this.conn
       .prepare('SELECT * FROM users WHERE role = ? AND is_demo = 1 ORDER BY created_at ASC LIMIT 1')
@@ -1242,8 +1378,36 @@ export class SqliteStore {
   }
 
   listUsers(): UserRecord[] {
-    const rows = this.conn.prepare('SELECT * FROM users ORDER BY created_at ASC').all() as unknown as UserRow[];
-    return rows.map((r) => this.hydrateUserRow(r));
+    return this.listUsersPage({ limit: 500, offset: 0 }).items;
+  }
+
+  listUsersPage(opts: { q?: string; limit?: number; offset?: number } = {}): {
+    items: UserRecord[];
+    total: number;
+  } {
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (opts.q && opts.q.trim()) {
+      const needle = `%${opts.q.trim().toLowerCase()}%`;
+      clauses.push('(lower(display_name) LIKE ? OR lower(city) LIKE ? OR lower(role) LIKE ?)');
+      params.push(needle, needle, needle);
+    }
+    const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const limit = Math.min(500, Math.max(1, opts.limit ?? 100));
+    const offset = Math.max(0, opts.offset ?? 0);
+
+    const totalRow = this.conn
+      .prepare(`SELECT COUNT(*) AS cnt FROM users ${whereSql}`)
+      .get(...params) as { cnt: number };
+    const rows = this.conn
+      .prepare(`SELECT * FROM users ${whereSql} ORDER BY created_at ASC LIMIT ? OFFSET ?`)
+      .all(...params, limit, offset) as unknown as UserRow[];
+
+    const userMap = this.findUsersByUuids(rows.map((r) => r.user_uuid));
+    return {
+      items: rows.map((r) => userMap.get(r.user_uuid)!).filter(Boolean),
+      total: totalRow.cnt,
+    };
   }
 
   createUser(user: UserRecord): UserRecord {
@@ -1313,12 +1477,121 @@ export class SqliteStore {
     });
   }
 
+  updateUserProfile(
+    userUuid: string,
+    patch: { display_name?: string; city?: string; bio?: string },
+  ): UserRecord | undefined {
+    const existing = this.findUserByUuid(userUuid);
+    if (!existing) return undefined;
+    const nextName = patch.display_name?.trim() || existing.display_name;
+    const nextCity = patch.city?.trim() || existing.city;
+    const nextBio = patch.bio !== undefined ? patch.bio.trim() || existing.bio : existing.bio;
+    this.conn
+      .prepare('UPDATE users SET display_name = ?, city = ?, bio = ? WHERE user_uuid = ?')
+      .run(nextName, nextCity, nextBio, userUuid);
+    return this.findUserByUuid(userUuid);
+  }
+
+  updateUserPassword(userUuid: string, newPasswordHash: string): boolean {
+    const info = this.conn
+      .prepare('UPDATE users SET password_hash = ? WHERE user_uuid = ?')
+      .run(newPasswordHash, userUuid);
+    return info.changes > 0;
+  }
+
+  blockUser(blockerUuid: string, blockedUuid: string, reason = ''): boolean {
+    if (blockerUuid === blockedUuid) return false;
+    const targetExists = this.conn.prepare('SELECT 1 FROM users WHERE user_uuid = ?').get(blockedUuid);
+    if (!targetExists) return false;
+    this.conn
+      .prepare('INSERT OR REPLACE INTO user_blocks (blocker_uuid, blocked_uuid, reason, created_at) VALUES (?, ?, ?, ?)')
+      .run(blockerUuid, blockedUuid, reason.trim().slice(0, 240), new Date().toISOString());
+    return true;
+  }
+
+  unblockUser(blockerUuid: string, blockedUuid: string): boolean {
+    const info = this.conn
+      .prepare('DELETE FROM user_blocks WHERE blocker_uuid = ? AND blocked_uuid = ?')
+      .run(blockerUuid, blockedUuid);
+    return info.changes > 0;
+  }
+
+  isBlockedBetween(userA: string, userB: string): boolean {
+    const row = this.conn
+      .prepare(
+        'SELECT 1 FROM user_blocks WHERE (blocker_uuid = ? AND blocked_uuid = ?) OR (blocker_uuid = ? AND blocked_uuid = ?) LIMIT 1',
+      )
+      .get(userA, userB, userB, userA);
+    return Boolean(row);
+  }
+
+  listBlockedUsers(blockerUuid: string): string[] {
+    const rows = this.conn
+      .prepare('SELECT blocked_uuid FROM user_blocks WHERE blocker_uuid = ? ORDER BY created_at DESC')
+      .all(blockerUuid) as Array<{ blocked_uuid: string }>;
+    return rows.map((r) => r.blocked_uuid);
+  }
+
+  createListingReport(report: ListingReport): ListingReport {
+    this.conn
+      .prepare(
+        'INSERT INTO listing_reports (id, listing_id, reporter_uuid, reason, details, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(report.id, report.listing_id, report.reporter_uuid, report.reason, report.details, report.created_at);
+    return report;
+  }
+
+  getGroundingCache(listingId: string, focusKey: string, ttlHours = 12): Record<string, unknown> | null {
+    const row = this.conn
+      .prepare('SELECT payload_json, created_at_ms FROM grounding_cache WHERE listing_id = ? AND focus_key = ?')
+      .get(listingId, focusKey) as { payload_json: string; created_at_ms: number } | undefined;
+    if (!row) return null;
+    const maxAgeMs = Math.max(1, ttlHours) * 60 * 60 * 1000;
+    if (Date.now() - row.created_at_ms > maxAgeMs) {
+      this.conn
+        .prepare('DELETE FROM grounding_cache WHERE listing_id = ? AND focus_key = ?')
+        .run(listingId, focusKey);
+      return null;
+    }
+    try {
+      return JSON.parse(row.payload_json) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  setGroundingCache(listingId: string, focusKey: string, payload: unknown): void {
+    const now = Date.now();
+    this.conn
+      .prepare(
+        'INSERT OR REPLACE INTO grounding_cache (listing_id, focus_key, payload_json, created_at_ms) VALUES (?, ?, ?, ?)',
+      )
+      .run(listingId, focusKey, JSON.stringify(payload), now);
+    this.conn
+      .prepare('DELETE FROM grounding_cache WHERE created_at_ms < ?')
+      .run(now - 7 * 24 * 60 * 60 * 1000);
+  }
+
   // ------------------------------------------------------------------
   // LISTINGS & SPATIAL QUERIES
   // ------------------------------------------------------------------
   findListingById(id: string): LandListing | undefined {
     const row = this.conn.prepare('SELECT * FROM listings WHERE id = ?').get(id) as ListingRow | undefined;
     return row ? this.hydrateListingRow(row) : undefined;
+  }
+
+  findListingsByIds(ids: string[]): Map<string, LandListing> {
+    const unique = Array.from(new Set(ids.filter(Boolean)));
+    const result = new Map<string, LandListing>();
+    if (unique.length === 0) return result;
+    const placeholders = unique.map(() => '?').join(',');
+    const rows = this.conn
+      .prepare(`SELECT * FROM listings WHERE id IN (${placeholders})`)
+      .all(...unique) as unknown as ListingRow[];
+    for (const r of rows) {
+      result.set(r.id, this.hydrateListingRow(r));
+    }
+    return result;
   }
 
   queryListings(filters: {
@@ -1351,9 +1624,21 @@ export class SqliteStore {
       params.push(filters.maxPrice);
     }
     if (filters.q && filters.q.trim()) {
-      const needle = `%${filters.q.trim().toLowerCase()}%`;
-      clauses.push('(lower(title) LIKE ? OR lower(locality) LIKE ? OR lower(description) LIKE ? OR lower(city) LIKE ?)');
-      params.push(needle, needle, needle, needle);
+      const tokens = filters.q
+        .trim()
+        .toLowerCase()
+        .split(/\s+/)
+        .map((t) => t.replace(/[^\p{L}\p{N}_-]/gu, ''))
+        .filter((t) => t.length >= 2);
+      if (this.hasFts5 && tokens.length > 0) {
+        const matchExpr = tokens.map((t) => `"${t}"*`).join(' ');
+        clauses.push('rowid IN (SELECT rowid FROM listings_fts WHERE listings_fts MATCH ?)');
+        params.push(matchExpr);
+      } else {
+        const needle = `%${filters.q.trim().toLowerCase()}%`;
+        clauses.push('(lower(title) LIKE ? OR lower(locality) LIKE ? OR lower(description) LIKE ? OR lower(city) LIKE ?)');
+        params.push(needle, needle, needle, needle);
+      }
     }
 
     const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -1579,28 +1864,112 @@ export class SqliteStore {
       `)
       .all(viewerUuid) as unknown as ChatRoomRow[];
 
+    if (roomRows.length === 0) return [];
+
+    const roomIds = roomRows.map((r) => r.id);
+    const roomPlaceholders = roomIds.map(() => '?').join(',');
+
+    const partRows = this.conn
+      .prepare(
+        `SELECT room_id, user_uuid FROM chat_participants WHERE room_id IN (${roomPlaceholders}) ORDER BY joined_at ASC`,
+      )
+      .all(...roomIds) as Array<{ room_id: string; user_uuid: string }>;
+    const participantsByRoom = new Map<string, string[]>();
+    for (const p of partRows) {
+      let arr = participantsByRoom.get(p.room_id);
+      if (!arr) {
+        arr = [];
+        participantsByRoom.set(p.room_id, arr);
+      }
+      arr.push(p.user_uuid);
+    }
+
+    const listingIds = roomRows.map((r) => r.listing_id).filter((id): id is string => Boolean(id));
+    const listingsById = this.findListingsByIds(listingIds);
+
+    const lastMsgRows = this.conn
+      .prepare(`
+        SELECT m.* FROM chat_messages m
+        JOIN (
+          SELECT room_id, MAX(rowid) AS max_rowid
+          FROM chat_messages
+          WHERE room_id IN (${roomPlaceholders})
+          GROUP BY room_id
+        ) latest ON latest.max_rowid = m.rowid
+      `)
+      .all(...roomIds) as unknown as ChatMessageRow[];
+    const lastMsgByRoom = new Map<string, ChatMessageRow>();
+    for (const m of lastMsgRows) {
+      lastMsgByRoom.set(m.room_id, m);
+    }
+
+    const lastMsgIds = lastMsgRows.map((m) => m.id);
+    const readsByMsg = new Map<string, string[]>();
+    if (lastMsgIds.length > 0) {
+      const msgPlaceholders = lastMsgIds.map(() => '?').join(',');
+      const readRows = this.conn
+        .prepare(`SELECT message_id, reader_uuid FROM message_reads WHERE message_id IN (${msgPlaceholders})`)
+        .all(...lastMsgIds) as Array<{ message_id: string; reader_uuid: string }>;
+      for (const rd of readRows) {
+        let arr = readsByMsg.get(rd.message_id);
+        if (!arr) {
+          arr = [];
+          readsByMsg.set(rd.message_id, arr);
+        }
+        arr.push(rd.reader_uuid);
+      }
+    }
+
+    const unreadRows = this.conn
+      .prepare(`
+        SELECT m.room_id, COUNT(*) AS cnt
+        FROM chat_messages m
+        WHERE m.room_id IN (${roomPlaceholders})
+          AND m.sender_uuid != ?
+          AND NOT EXISTS (
+            SELECT 1 FROM message_reads mr WHERE mr.message_id = m.id AND mr.reader_uuid = ?
+          )
+        GROUP BY m.room_id
+      `)
+      .all(...roomIds, viewerUuid, viewerUuid) as Array<{ room_id: string; cnt: number }>;
+    const unreadByRoom = new Map<string, number>();
+    for (const u of unreadRows) {
+      unreadByRoom.set(u.room_id, u.cnt);
+    }
+
     return roomRows.map((rr) => {
-      const room = this.findChatRoomById(rr.id)!;
-      const listing = rr.listing_id ? this.findListingById(rr.listing_id) ?? null : null;
-      const lastRow = this.conn
-        .prepare('SELECT * FROM chat_messages WHERE room_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')
-        .get(rr.id) as ChatMessageRow | undefined;
-      const unreadRow = this.conn
-        .prepare(`
-          SELECT COUNT(*) AS cnt FROM chat_messages m
-          WHERE m.room_id = ?
-            AND m.sender_uuid != ?
-            AND NOT EXISTS (
-              SELECT 1 FROM message_reads mr WHERE mr.message_id = m.id AND mr.reader_uuid = ?
-            )
-        `)
-        .get(rr.id, viewerUuid, viewerUuid) as { cnt: number };
+      const room: ChatRoom = {
+        id: rr.id,
+        room_type: rr.room_type as 'DIRECT' | 'MEETING_ROOM',
+        title: rr.title,
+        listing_id: rr.listing_id ?? '',
+        participant_uuids: participantsByRoom.get(rr.id) ?? [],
+        created_by_uuid: rr.created_by_uuid,
+        created_at: rr.created_at,
+        updated_at: rr.updated_at,
+      };
+      const lastRow = lastMsgByRoom.get(rr.id);
+      const lastMessage: ChatMessage | null = lastRow
+        ? {
+            id: lastRow.id,
+            room_id: lastRow.room_id,
+            sender_uuid: lastRow.sender_uuid,
+            message_type: lastRow.message_type as 'TEXT' | 'SYSTEM',
+            body: lastRow.body,
+            ...(lastRow.attachment_url ? { attachment_url: lastRow.attachment_url } : {}),
+            ...(lastRow.attachment_name ? { attachment_name: lastRow.attachment_name } : {}),
+            ...(lastRow.attachment_type ? { attachment_type: lastRow.attachment_type } : {}),
+            delivery_state: lastRow.delivery_state as MessageDeliveryState,
+            read_by_uuids: readsByMsg.get(lastRow.id) ?? [],
+            created_at: lastRow.created_at,
+          }
+        : null;
 
       return {
         room,
-        listing,
-        last_message: lastRow ? this.hydrateMessageRow(lastRow) : null,
-        unread_count: unreadRow.cnt,
+        listing: rr.listing_id ? listingsById.get(rr.listing_id) ?? null : null,
+        last_message: lastMessage,
+        unread_count: unreadByRoom.get(rr.id) ?? 0,
       };
     });
   }
@@ -1615,6 +1984,9 @@ export class SqliteStore {
       sender_uuid: row.sender_uuid,
       message_type: row.message_type as 'TEXT' | 'SYSTEM',
       body: row.body,
+      ...(row.attachment_url ? { attachment_url: row.attachment_url } : {}),
+      ...(row.attachment_name ? { attachment_name: row.attachment_name } : {}),
+      ...(row.attachment_type ? { attachment_type: row.attachment_type } : {}),
       delivery_state: row.delivery_state as MessageDeliveryState,
       read_by_uuids: reads.map((r) => r.reader_uuid),
       created_at: row.created_at,
@@ -1646,14 +2018,25 @@ export class SqliteStore {
       }
 
       const insMsg = this.conn.prepare(`
-        INSERT INTO chat_messages (id, room_id, sender_uuid, message_type, body, delivery_state, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO chat_messages (id, room_id, sender_uuid, message_type, body, attachment_url, attachment_name, attachment_type, delivery_state, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const insRead = this.conn.prepare(
         'INSERT OR IGNORE INTO message_reads (message_id, reader_uuid, read_at) VALUES (?, ?, ?)',
       );
       for (const m of initialMessages) {
-        insMsg.run(m.id, m.room_id, m.sender_uuid, m.message_type, m.body, m.delivery_state, m.created_at);
+        insMsg.run(
+          m.id,
+          m.room_id,
+          m.sender_uuid,
+          m.message_type,
+          m.body,
+          m.attachment_url ?? null,
+          m.attachment_name ?? null,
+          m.attachment_type ?? null,
+          m.delivery_state,
+          m.created_at,
+        );
         for (const r of m.read_by_uuids) {
           insRead.run(m.id, r, m.created_at);
         }
@@ -1741,10 +2124,21 @@ export class SqliteStore {
     this.withTransaction(() => {
       this.conn
         .prepare(`
-          INSERT INTO chat_messages (id, room_id, sender_uuid, message_type, body, delivery_state, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO chat_messages (id, room_id, sender_uuid, message_type, body, attachment_url, attachment_name, attachment_type, delivery_state, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
-        .run(msg.id, msg.room_id, msg.sender_uuid, msg.message_type, msg.body, msg.delivery_state, msg.created_at);
+        .run(
+          msg.id,
+          msg.room_id,
+          msg.sender_uuid,
+          msg.message_type,
+          msg.body,
+          msg.attachment_url ?? null,
+          msg.attachment_name ?? null,
+          msg.attachment_type ?? null,
+          msg.delivery_state,
+          msg.created_at,
+        );
       for (const r of msg.read_by_uuids) {
         this.conn
           .prepare('INSERT OR IGNORE INTO message_reads (message_id, reader_uuid, read_at) VALUES (?, ?, ?)')
@@ -1989,6 +2383,15 @@ export class SqliteStore {
       calls: cs,
       spatial_valid: badCoords === 0,
     };
+  }
+
+  checkpointAndClose() {
+    try {
+      this.conn.exec('PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);');
+    } catch {
+      // ignore if already closing
+    }
+    this.conn.close();
   }
 
   close() {

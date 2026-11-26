@@ -96,6 +96,7 @@ export function LandingPage({ onAuthenticated }: LandingPageProps) {
   const [role, setRole] = useState<'BUYER' | 'SELLER' | 'BROKER'>('BUYER');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [demoAuthEnabled, setDemoAuthEnabled] = useState(true);
 
   useEffect(() => {
     fetch('/api/v1/public/listings')
@@ -105,6 +106,15 @@ export function LandingPage({ onAuthenticated }: LandingPageProps) {
       })
       .catch(() => {})
       .finally(() => setShowcaseLoading(false));
+
+    fetch('/api/v1/config/maps')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((cfg: { demoAuthEnabled?: boolean } | null) => {
+        if (typeof cfg?.demoAuthEnabled === 'boolean') {
+          setDemoAuthEnabled(cfg.demoAuthEnabled);
+        }
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -180,49 +190,61 @@ export function LandingPage({ onAuthenticated }: LandingPageProps) {
   };
 
   const renderAuthPanel = (compact = false) => (
-    <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-      <div className="lg:col-span-6 bg-[#0A3D31] text-white rounded-2xl p-6 sm:p-8 flex flex-col justify-between">
-        <div>
-          <p className="text-xs font-medium text-emerald-200">1-Click Demo Role Switcher</p>
-          <h3 className="mt-2 font-display text-2xl font-bold tracking-tight text-balance">
-            Step directly into a buyer, landowner, or broker workspace.
-          </h3>
-          <p className="mt-2 text-sm text-emerald-100/85 leading-relaxed">
-            Open two browser tabs with different roles to test live messaging, deal rooms, and audio/video calls immediately.
-          </p>
-        </div>
-
-        <div className="mt-6 space-y-2.5">
-          {PREVIEW_PROFILES.map((acct) => (
-            <button
-              key={acct.role}
-              type="button"
-              disabled={loading}
-              onClick={() => handleQuickProfile(acct.role)}
-              className="w-full text-left bg-white/10 hover:bg-white/15 border border-white/15 rounded-xl px-4 py-3 flex items-center justify-between gap-4 transition-colors min-h-[56px]"
-            >
-              <div className="min-w-0">
-                <div className="text-sm font-semibold text-white flex items-center flex-wrap gap-x-2 gap-y-0.5">
-                  <span>{acct.name}</span>
-                  <span aria-hidden="true">·</span>
-                  <span className="text-xs font-medium text-emerald-200">{acct.roleLabel}</span>
-                </div>
-                <p className="text-xs text-emerald-100/80 line-clamp-2 sm:truncate mt-0.5">{acct.summary}</p>
-              </div>
-              <ArrowRight className="w-4 h-4 text-emerald-100 shrink-0" />
-            </button>
-          ))}
-        </div>
-
-        {!compact && (
-          <div className="mt-6 pt-4 border-t border-white/15 flex items-center gap-2 text-xs text-emerald-100">
-            <ShieldCheck className="w-4 h-4 shrink-0" />
-            <span>Personal phone numbers stay masked until both parties choose to share</span>
+    <div
+      className={
+        demoAuthEnabled
+          ? 'grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch'
+          : 'max-w-xl mx-auto'
+      }
+    >
+      {demoAuthEnabled && (
+        <div className="lg:col-span-6 bg-[#0A3D31] text-white rounded-2xl p-6 sm:p-8 flex flex-col justify-between">
+          <div>
+            <p className="text-xs font-medium text-emerald-200">1-Click Demo Role Switcher</p>
+            <h3 className="mt-2 font-display text-2xl font-bold tracking-tight text-balance">
+              Step directly into a buyer, landowner, or broker workspace.
+            </h3>
+            <p className="mt-2 text-sm text-emerald-100/85 leading-relaxed">
+              Open two browser tabs with different roles to test live messaging, deal rooms, and audio/video calls immediately.
+            </p>
           </div>
-        )}
-      </div>
 
-      <div className="lg:col-span-6 bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 flex flex-col justify-center">
+          <div className="mt-6 space-y-2.5">
+            {PREVIEW_PROFILES.map((acct) => (
+              <button
+                key={acct.role}
+                type="button"
+                disabled={loading}
+                onClick={() => handleQuickProfile(acct.role)}
+                className="w-full text-left bg-white/10 hover:bg-white/15 border border-white/15 rounded-xl px-4 py-3 flex items-center justify-between gap-4 transition-colors min-h-[56px]"
+              >
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-white flex items-center flex-wrap gap-x-2 gap-y-0.5">
+                    <span>{acct.name}</span>
+                    <span aria-hidden="true">·</span>
+                    <span className="text-xs font-medium text-emerald-200">{acct.roleLabel}</span>
+                  </div>
+                  <p className="text-xs text-emerald-100/80 line-clamp-2 sm:truncate mt-0.5">{acct.summary}</p>
+                </div>
+                <ArrowRight className="w-4 h-4 text-emerald-100 shrink-0" />
+              </button>
+            ))}
+          </div>
+
+          {!compact && (
+            <div className="mt-6 pt-4 border-t border-white/15 flex items-center gap-2 text-xs text-emerald-100">
+              <ShieldCheck className="w-4 h-4 shrink-0" />
+              <span>Personal phone numbers stay masked until both parties choose to share</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div
+        className={`${
+          demoAuthEnabled ? 'lg:col-span-6' : ''
+        } bg-white rounded-2xl border border-slate-200 p-6 sm:p-8 flex flex-col justify-center`}
+      >
         <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg w-fit">
           <button
             type="button"

@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import type { WebSocket } from 'ws';
 import { metrics } from './metrics.ts';
+import { InProcessRealtimeBus, type RealtimeBus } from './realtimeBus.ts';
 import { issueEphemeralCallToken, toPrivacySafeProfile } from './security.ts';
 import { db, type SqliteStore } from './store.ts';
 import type { CallMode, CallSession, CallState } from './types.ts';
@@ -21,9 +22,36 @@ export class CallSignalingEngine {
   /** user_uuid -> current active call_id (for BUSY detection) */
   private busyUsers = new Map<string, string>();
   private store: SqliteStore;
+  private bus: RealtimeBus;
+  private unsubscribeBus: () => void;
 
-  constructor(store: SqliteStore = db) {
+  constructor(store: SqliteStore = db, bus: RealtimeBus = new InProcessRealtimeBus()) {
     this.store = store;
+    this.bus = bus;
+    this.unsubscribeBus = this.bus.subscribe((envelope) => {
+      const raw = JSON.stringify(envelope.payload);
+      if (envelope.targets === '*') {
+        for (const [uid, set] of this.userSockets.entries()) {
+          if (envelope.excludeUuid && uid === envelope.excludeUuid) continue;
+          for (const sock of set) {
+            if (sock.readyState === sock.OPEN) {
+              sock.send(raw);
+            }
+          }
+        }
+        return;
+      }
+      for (const uid of envelope.targets) {
+        if (envelope.excludeUuid && uid === envelope.excludeUuid) continue;
+        const set = this.userSockets.get(uid);
+        if (!set) continue;
+        for (const sock of set) {
+          if (sock.readyState === sock.OPEN) {
+            sock.send(raw);
+          }
+        }
+      }
+    });
   }
 
   reconcileOnBoot(): number {
@@ -75,35 +103,20 @@ export class CallSignalingEngine {
         runtime.timeoutHandle = null;
       }
     }
+    this.unsubscribeBus();
+    this.bus.close();
   }
 
   sendToUser(userUuid: string, message: unknown) {
-    const set = this.userSockets.get(userUuid);
-    if (!set) return;
-    const raw = JSON.stringify(message);
-    for (const sock of set) {
-      if (sock.readyState === sock.OPEN) {
-        sock.send(raw);
-      }
-    }
+    this.bus.publish({ targets: [userUuid], payload: message });
   }
 
   sendToUsers(userUuids: string[], message: unknown, excludeUuid?: string) {
-    for (const uuid of userUuids) {
-      if (excludeUuid && uuid === excludeUuid) continue;
-      this.sendToUser(uuid, message);
-    }
+    this.bus.publish({ targets: userUuids, excludeUuid, payload: message });
   }
 
   broadcastAll(message: unknown) {
-    const raw = JSON.stringify(message);
-    for (const set of this.userSockets.values()) {
-      for (const sock of set) {
-        if (sock.readyState === sock.OPEN) {
-          sock.send(raw);
-        }
-      }
-    }
+    this.bus.publish({ targets: '*', payload: message });
   }
 
   isUserBusy(userUuid: string): boolean {
@@ -162,6 +175,13 @@ export class CallSignalingEngine {
     }
 
     for (const callee of validCallees) {
+      if (this.store.isBlockedBetween(callerUuid, callee.user_uuid)) {
+        return {
+          ok: false,
+          error: 'Calls are blocked between participants in this thread',
+          statusCode: 403,
+        };
+      }
       if (!callee.allow_calls) {
         return {
           ok: false,

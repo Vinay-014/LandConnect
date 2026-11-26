@@ -1,18 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import {
   ArrowLeft,
+  Ban,
+  Bell,
   Box,
   Check,
   CheckCheck,
   Compass,
   Edit3,
   ExternalLink,
+  FileText,
+  Flag,
   Globe,
+  KeyRound,
   Lock,
   LogOut,
   Map as MapIcon,
   MapPin,
   MessageSquare,
+  Paperclip,
   Phone,
   PhoneCall,
   PhoneIncoming,
@@ -27,6 +33,7 @@ import {
   User,
   Users,
   Video,
+  X,
 } from 'lucide-react';
 import {
   apiRequest,
@@ -89,6 +96,11 @@ function ListingImage({ src, alt }: { src?: string; alt: string }) {
   );
 }
 
+function isSafeAttachmentUrl(url?: string): boolean {
+  if (!url) return false;
+  return url.startsWith('/uploads/') || url.startsWith('https://');
+}
+
 export default function App() {
   const [currentUser, setCurrentUser] = useState<PublicUserProfile | null>(null);
   const [activeTab, setActiveTab] = useState<AppTab>('communities');
@@ -96,6 +108,8 @@ export default function App() {
 
   // Listings & Geospatial state
   const [listings, setListings] = useState<LandListing[]>([]);
+  const [totalListings, setTotalListings] = useState<number>(0);
+  const [hasMoreListings, setHasMoreListings] = useState(false);
   const [listingsLoading, setListingsLoading] = useState(false);
   const [selectedListingId, setSelectedListingId] = useState<string | null>(null);
   const [landTypeFilter, setLandTypeFilter] = useState<'ALL' | LandType>('ALL');
@@ -119,16 +133,36 @@ export default function App() {
   const [groundingByListing, setGroundingByListing] = useState<Record<string, ParcelGroundingInsights>>({});
   const [listingModalOpen, setListingModalOpen] = useState(false);
   const [editingListing, setEditingListing] = useState<LandListing | null>(null);
+  const [reportingListing, setReportingListing] = useState<LandListing | null>(null);
+  const [reportReason, setReportReason] = useState('Misleading pricing or area details');
+  const [reportDetails, setReportDetails] = useState('');
+  const [reportSubmitting, setReportSubmitting] = useState(false);
 
   // Chats & Deal Rooms state
   const [chats, setChats] = useState<ChatRoomSummary[]>([]);
   const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
   const [messagesByRoom, setMessagesByRoom] = useState<Record<string, ChatMessage[]>>({});
   const [draftMessage, setDraftMessage] = useState('');
+  const [uploadingAttachment, setUploadingAttachment] = useState(false);
   const [typingUsersByRoom, setTypingUsersByRoom] = useState<Record<string, string[]>>({});
   const [meetingModalOpen, setMeetingModalOpen] = useState(false);
   const [allUsers, setAllUsers] = useState<PublicUserProfile[]>([]);
+  const [blockedUsers, setBlockedUsers] = useState<PublicUserProfile[]>([]);
   const [onlineUsers, setOnlineUsers] = useState<Set<string>>(new Set());
+
+  // Account & Notification Preferences
+  const [profileName, setProfileName] = useState('');
+  const [profileCity, setProfileCity] = useState('');
+  const [profileBio, setProfileBio] = useState('');
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [passwordSaving, setPasswordSaving] = useState(false);
+  const [notificationsEnabled, setNotificationsEnabled] = useState(
+    () => typeof Notification !== 'undefined' && Notification.permission === 'granted',
+  );
+  const notificationsEnabledRef = useRef(notificationsEnabled);
+  notificationsEnabledRef.current = notificationsEnabled;
 
   // Active Call state
   const [callLogs, setCallLogs] = useState<CallLogEntry[]>([]);
@@ -145,6 +179,7 @@ export default function App() {
   // Realtime messaging reference
   const wsRef = useRef<WebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const typingTimeoutRef = useRef<number | null>(null);
   const hasLoadedListingsRef = useRef(false);
 
@@ -155,7 +190,7 @@ export default function App() {
     }, 4000);
   }, []);
 
-  const loadListings = useCallback(async () => {
+  const loadListings = useCallback(async (offset = 0, append = false) => {
     if (!currentUser) return;
     setListingsLoading(true);
     try {
@@ -164,6 +199,8 @@ export default function App() {
           `/api/v1/listings/nearby?lat=${searchCenter.lat}&lng=${searchCenter.lng}&radius_km=${radiusKm}`,
         );
         setListings(res.listings);
+        setTotalListings(res.listings.length);
+        setHasMoreListings(false);
       } else {
         const params = new URLSearchParams();
         if (landTypeFilter !== 'ALL') params.set('land_type', landTypeFilter);
@@ -171,8 +208,16 @@ export default function App() {
         if (searchQuery.trim()) params.set('q', searchQuery.trim());
         params.set('max_price', String(Math.round(maxPriceCr * 10000000)));
         params.set('sort', sortBy);
-        const res = await apiRequest<{ listings: LandListing[] }>(`/api/v1/listings?${params.toString()}`);
-        setListings(res.listings);
+        params.set('limit', '24');
+        params.set('offset', String(offset));
+        const res = await apiRequest<{
+          listings: LandListing[];
+          total?: number;
+          has_more?: boolean;
+        }>(`/api/v1/listings?${params.toString()}`);
+        setListings((prev) => (append ? [...prev, ...res.listings] : res.listings));
+        setTotalListings(res.total ?? res.listings.length);
+        setHasMoreListings(Boolean(res.has_more));
       }
     } catch (err) {
       showToast(err instanceof ApiError ? err.detail : 'Failed to load listings', 'error');
@@ -206,6 +251,16 @@ export default function App() {
     try {
       const res = await apiRequest<{ users: PublicUserProfile[] }>('/api/v1/users');
       setAllUsers(res.users);
+    } catch {
+      // silent
+    }
+  }, [currentUser]);
+
+  const loadBlockedUsers = useCallback(async () => {
+    if (!currentUser) return;
+    try {
+      const res = await apiRequest<{ blocked_users: PublicUserProfile[] }>('/api/v1/users/blocked');
+      setBlockedUsers(res.blocked_users);
     } catch {
       // silent
     }
@@ -292,11 +347,15 @@ export default function App() {
   // Initial session hydration on login
   useEffect(() => {
     if (!currentUser) return;
+    setProfileName(currentUser.display_name);
+    setProfileCity(currentUser.city);
+    setProfileBio(currentUser.bio);
     loadChats();
     loadCallLogs();
     loadUsers();
+    loadBlockedUsers();
     hydrateActiveCall();
-  }, [currentUser?.user_uuid, loadChats, loadCallLogs, loadUsers, hydrateActiveCall]);
+  }, [currentUser?.user_uuid, loadChats, loadCallLogs, loadUsers, loadBlockedUsers, hydrateActiveCall]);
 
   // Listings fetch: immediate on first login, debounced on filter changes, skipped while bbox pan mode owns spatial query
   useEffect(() => {
@@ -338,6 +397,7 @@ export default function App() {
   // Real-time WebSocket Connection (Chat + Presence + WebRTC Signaling)
   useEffect(() => {
     if (!currentUser) return;
+    const activeUserUuid = currentUser.user_uuid;
 
     let closedIntentionally = false;
     let reconnectTimer: number | null = null;
@@ -383,6 +443,19 @@ export default function App() {
               if (existing.some((m) => m.id === msg.id)) return prev;
               return { ...prev, [msg.room_id]: [...existing, msg] };
             });
+            if (
+              msg.sender_uuid !== activeUserUuid &&
+              document.hidden &&
+              notificationsEnabledRef.current &&
+              typeof Notification !== 'undefined' &&
+              Notification.permission === 'granted'
+            ) {
+              try {
+                new Notification('New message on LandConnect', { body: msg.body.slice(0, 120) });
+              } catch {
+                // ignore notification restrictions
+              }
+            }
             loadChats();
           } else if (event === 'chat.read_receipt') {
             const roomId = String(payload.room_id);
@@ -421,6 +494,20 @@ export default function App() {
           } else if (event === 'call.invite') {
             const call = payload.call as CallSession;
             const caller = payload.caller as PublicUserProfile;
+            if (
+              document.hidden &&
+              notificationsEnabledRef.current &&
+              typeof Notification !== 'undefined' &&
+              Notification.permission === 'granted'
+            ) {
+              try {
+                new Notification(`Incoming ${call.mode === 'VIDEO' ? 'Video' : 'Audio'} Call`, {
+                  body: `${caller?.display_name ?? 'LandConnect member'} · ${String(payload.listing_title || 'Parcel Inquiry')}`,
+                });
+              } catch {
+                // ignore notification restrictions
+              }
+            }
             setActiveCall({
               call,
               direction: 'INCOMING',
@@ -741,6 +828,153 @@ export default function App() {
       showToast('Privacy settings updated');
     } catch (err) {
       showToast(err instanceof ApiError ? err.detail : 'Failed to update privacy', 'error');
+    }
+  };
+
+  const handleUploadAttachment = async (file: File) => {
+    if (!activeRoomId) return;
+    if (file.size > 5 * 1024 * 1024) {
+      showToast('File size must be under 5 MB', 'error');
+      return;
+    }
+    setUploadingAttachment(true);
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(new Error('Could not read file'));
+        reader.readAsDataURL(file);
+      });
+      const msg = await apiRequest<ChatMessage>(`/api/v1/chats/${activeRoomId}/attachments`, {
+        method: 'POST',
+        body: JSON.stringify({
+          filename: file.name,
+          data_url: dataUrl,
+          body: draftMessage.trim() || undefined,
+        }),
+      });
+      if (draftMessage.trim()) setDraftMessage('');
+      setMessagesByRoom((prev) => {
+        const list = prev[activeRoomId] || [];
+        if (list.some((m) => m.id === msg.id)) return prev;
+        return { ...prev, [activeRoomId]: [...list, msg] };
+      });
+      loadChats();
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.detail : 'Failed to upload document', 'error');
+    } finally {
+      setUploadingAttachment(false);
+    }
+  };
+
+  const handleBlockUser = async (peerUuid: string, peerName: string) => {
+    try {
+      await apiRequest(`/api/v1/users/${peerUuid}/block`, {
+        method: 'POST',
+        body: JSON.stringify({ reason: 'Blocked from deal conversation' }),
+      });
+      await loadBlockedUsers();
+      showToast(`${peerName} has been blocked from messaging or calling you`);
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.detail : 'Failed to block user', 'error');
+    }
+  };
+
+  const handleUnblockUser = async (peerUuid: string) => {
+    try {
+      await apiRequest(`/api/v1/users/${peerUuid}/block`, { method: 'DELETE' });
+      await loadBlockedUsers();
+      showToast('User unblocked');
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.detail : 'Failed to unblock user', 'error');
+    }
+  };
+
+  const handleSubmitReport = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!reportingListing) return;
+    setReportSubmitting(true);
+    try {
+      await apiRequest(`/api/v1/listings/${reportingListing.id}/report`, {
+        method: 'POST',
+        body: JSON.stringify({
+          reason: reportReason,
+          details: reportDetails.trim(),
+        }),
+      });
+      showToast('Report submitted for moderation review');
+      setReportingListing(null);
+      setReportDetails('');
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.detail : 'Unable to submit report', 'error');
+    } finally {
+      setReportSubmitting(false);
+    }
+  };
+
+  const handleSaveProfile = async (e: FormEvent) => {
+    e.preventDefault();
+    setProfileSaving(true);
+    try {
+      const updated = await apiRequest<PublicUserProfile>('/api/v1/auth/profile', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          display_name: profileName,
+          city: profileCity,
+          bio: profileBio,
+        }),
+      });
+      setCurrentUser(updated);
+      showToast('Profile details saved');
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.detail : 'Failed to update profile', 'error');
+    } finally {
+      setProfileSaving(false);
+    }
+  };
+
+  const handleChangePassword = async (e: FormEvent) => {
+    e.preventDefault();
+    setPasswordSaving(true);
+    try {
+      await apiRequest('/api/v1/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword,
+        }),
+      });
+      setCurrentPassword('');
+      setNewPassword('');
+      showToast('Password updated successfully');
+    } catch (err) {
+      showToast(err instanceof ApiError ? err.detail : 'Failed to change password', 'error');
+    } finally {
+      setPasswordSaving(false);
+    }
+  };
+
+  const handleToggleNotifications = async () => {
+    if (typeof Notification === 'undefined') {
+      showToast('Browser notifications are not supported on this device', 'error');
+      return;
+    }
+    if (notificationsEnabled) {
+      setNotificationsEnabled(false);
+      showToast('Background alerts muted');
+      return;
+    }
+    if (Notification.permission === 'granted') {
+      setNotificationsEnabled(true);
+      showToast('Background call & message alerts enabled');
+      return;
+    }
+    const perm = await Notification.requestPermission();
+    if (perm === 'granted') {
+      setNotificationsEnabled(true);
+      showToast('Background call & message alerts enabled');
+    } else {
+      showToast('Notification permission was declined by browser', 'error');
     }
   };
 
@@ -1227,6 +1461,20 @@ export default function App() {
                       );
                     })
                   )}
+                  {hasMoreListings && !radiusEnabled && !bboxSearchEnabled && (
+                    <div className={viewMode === 'split' ? 'pt-2 flex justify-center' : 'col-span-full pt-2 flex justify-center'}>
+                      <button
+                        type="button"
+                        disabled={listingsLoading}
+                        onClick={() => loadListings(listings.length, true)}
+                        className="min-h-[44px] px-5 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-medium text-[#075E54] disabled:opacity-50"
+                      >
+                        {listingsLoading
+                          ? 'Loading parcels...'
+                          : `Load More Parcels (${listings.length} of ${totalListings})`}
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1364,21 +1612,42 @@ export default function App() {
                               'Verified Member'}
                           </span>
                           <span className="text-slate-400"> · </span>
+                          {onlineUsers.has(
+                            selectedListing.broker_uuid && selectedListing.broker_uuid !== currentUser.user_uuid
+                              ? selectedListing.broker_uuid
+                              : selectedListing.owner_uuid,
+                          ) ? (
+                            <span className="text-[11px] text-[#008069] font-medium">Online</span>
+                          ) : (
+                            <span className="text-[11px] text-slate-500">Offline</span>
+                          )}
+                          <span className="text-slate-400"> · </span>
                           <span className="text-[11px] text-slate-500">
                             Contact protected until consent
                           </span>
                         </div>
-                        {currentUser.role === 'BROKER' && (
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {currentUser.role === 'BROKER' && (
+                            <button
+                              type="button"
+                              onClick={() => handleVerifyListing(selectedListing)}
+                              className="min-h-[44px] sm:min-h-[32px] px-3 py-1 rounded-lg border border-slate-200 hover:bg-slate-50 text-[11px] font-medium text-[#075E54]"
+                            >
+                              {selectedListing.verification_status === 'VERIFIED'
+                                ? 'Mark RERA Approved'
+                                : 'Verify Parcel'}
+                            </button>
+                          )}
                           <button
                             type="button"
-                            onClick={() => handleVerifyListing(selectedListing)}
-                            className="min-h-[44px] sm:min-h-[32px] px-3 py-1 rounded-lg border border-slate-200 hover:bg-slate-50 text-[11px] font-medium text-[#075E54]"
+                            onClick={() => setReportingListing(selectedListing)}
+                            className="min-h-[44px] sm:min-h-[32px] px-2.5 py-1 rounded-lg border border-slate-200 hover:bg-red-50 text-[11px] font-medium text-slate-600 hover:text-red-700 flex items-center gap-1"
+                            aria-label="Report parcel listing"
                           >
-                            {selectedListing.verification_status === 'VERIFIED'
-                              ? 'Mark RERA Approved'
-                              : 'Verify Parcel'}
+                            <Flag className="w-3 h-3" />
+                            <span>Report</span>
                           </button>
-                        )}
+                        </div>
                       </div>
 
                       {/* Locality, Zoning & Nearby Infrastructure Brief */}
@@ -1557,7 +1826,7 @@ export default function App() {
                               <span>{room.room_type === 'MEETING_ROOM' ? 'Deal Room' : 'Direct'}</span>
                               <span aria-hidden="true">·</span>
                               <span className="truncate">
-                                {peers.map((p) => p.display_name.split(' ')[0]).join(', ')}
+                                {peers.map((p) => p.display_name).join(', ')}
                               </span>
                               {anyOnline && (
                                 <>
@@ -1629,9 +1898,19 @@ export default function App() {
                             <span aria-hidden="true">·</span>
                             <span className="truncate">
                               {activeChat.participants
-                                .map((p) => `${p.display_name.split(' ')[0]} [${p.role}]`)
+                                .map((p) =>
+                                  `${p.display_name}${p.user_uuid === currentUser.user_uuid ? ' (You)' : ''} [${p.role}]`,
+                                )
                                 .join(', ')}
                             </span>
+                            <span aria-hidden="true">·</span>
+                            {activeChat.participants.some(
+                              (p) => p.user_uuid !== currentUser.user_uuid && onlineUsers.has(p.user_uuid),
+                            ) ? (
+                              <span className="text-[#008069] font-medium shrink-0">Online</span>
+                            ) : (
+                              <span className="text-slate-400 shrink-0">Offline</span>
+                            )}
                           </div>
                         </div>
                       </div>
@@ -1688,30 +1967,50 @@ export default function App() {
                             const hasConsented =
                               Boolean(currentUser.show_contact_after_consent) &&
                               Boolean(currentUser.consented_peer_uuids?.includes(peer.user_uuid));
+                            const isBlocked = blockedUsers.some((b) => b.user_uuid === peer.user_uuid);
                             return (
-                              <button
-                                key={peer.user_uuid}
-                                type="button"
-                                onClick={() =>
-                                  handleTogglePrivacy(
+                              <div key={peer.user_uuid} className="flex items-center gap-1.5 flex-wrap">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleTogglePrivacy(
+                                      hasConsented
+                                        ? { revoke_peer_uuid: peer.user_uuid }
+                                        : {
+                                            show_contact_after_consent: true,
+                                            consent_peer_uuid: peer.user_uuid,
+                                          },
+                                    )
+                                  }
+                                  className={`min-h-[44px] sm:min-h-[32px] px-3 py-1.5 rounded-lg border text-[11px] font-medium whitespace-nowrap transition-colors ${
                                     hasConsented
-                                      ? { revoke_peer_uuid: peer.user_uuid }
-                                      : {
-                                          show_contact_after_consent: true,
-                                          consent_peer_uuid: peer.user_uuid,
-                                        },
-                                  )
-                                }
-                                className={`min-h-[44px] sm:min-h-[32px] px-3 py-1.5 rounded-lg border text-[11px] font-medium whitespace-nowrap transition-colors ${
-                                  hasConsented
-                                    ? 'border-[#008069] bg-[#008069]/10 text-[#075E54] hover:bg-red-50 hover:text-red-700 hover:border-red-200'
-                                    : 'border-slate-200 bg-white hover:bg-slate-100 text-[#075E54]'
-                                }`}
-                              >
-                                {hasConsented
-                                  ? `Revoke Contact (${peer.display_name.split(' ')[0]})`
-                                  : `Share Contact with ${peer.display_name.split(' ')[0]}`}
-                              </button>
+                                      ? 'border-[#008069] bg-[#008069]/10 text-[#075E54] hover:bg-red-50 hover:text-red-700 hover:border-red-200'
+                                      : 'border-slate-200 bg-white hover:bg-slate-100 text-[#075E54]'
+                                  }`}
+                                >
+                                  {hasConsented
+                                    ? `Revoke Contact (${peer.display_name})`
+                                    : `Share Contact with ${peer.display_name}`}
+                                </button>
+                                {activeChat.room_type === 'DIRECT' && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      isBlocked
+                                        ? handleUnblockUser(peer.user_uuid)
+                                        : handleBlockUser(peer.user_uuid, peer.display_name)
+                                    }
+                                    className={`min-h-[44px] sm:min-h-[32px] px-2.5 py-1.5 rounded-lg border text-[11px] font-medium whitespace-nowrap flex items-center gap-1 transition-colors ${
+                                      isBlocked
+                                        ? 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100'
+                                        : 'border-slate-200 bg-white hover:bg-red-50 text-slate-600 hover:text-red-700'
+                                    }`}
+                                  >
+                                    <Ban className="w-3 h-3" />
+                                    <span>{isBlocked ? 'Unblock' : 'Block'}</span>
+                                  </button>
+                                )}
+                              </div>
                             );
                           })}
 
@@ -1781,6 +2080,37 @@ export default function App() {
                                   {sender.display_name} · {sender.role}
                                 </div>
                               )}
+                              {isSafeAttachmentUrl(msg.attachment_url) && (
+                                <div className="mb-2">
+                                  {msg.attachment_type?.startsWith('image/') ? (
+                                    <a
+                                      href={msg.attachment_url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="block rounded-xl overflow-hidden border border-slate-200/80 bg-white"
+                                    >
+                                      <img
+                                        src={msg.attachment_url}
+                                        alt={msg.attachment_name || 'Shared image'}
+                                        className="max-h-56 w-full object-cover"
+                                      />
+                                    </a>
+                                  ) : (
+                                    <a
+                                      href={msg.attachment_url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="flex items-center gap-2.5 rounded-xl border border-slate-200 bg-white/90 hover:bg-white px-3 py-2 text-xs font-medium text-[#075E54]"
+                                    >
+                                      <FileText className="w-4 h-4 shrink-0" />
+                                      <span className="truncate flex-1">
+                                        {msg.attachment_name || 'Deal Document (PDF)'}
+                                      </span>
+                                      <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                                    </a>
+                                  )}
+                                </div>
+                              )}
                               <p className="text-sm leading-relaxed whitespace-pre-wrap mobile-safe-wrap">{msg.body}</p>
                               <div className="mt-1 flex items-center justify-end gap-1 text-[10px] text-slate-500 font-mono tabular-nums">
                                 <span>{timeStr}</span>
@@ -1804,22 +2134,49 @@ export default function App() {
                       <div ref={messagesEndRef} />
                     </div>
 
-                    {/* Message Composer */}
+                    {/* Message Composer & Deal Room Document Vault */}
                     <form
                       onSubmit={handleSendMessage}
-                      className="bg-white border-t border-slate-200 p-3 flex items-center gap-2.5"
+                      className="bg-white border-t border-slate-200 p-3 flex items-center gap-2"
                     >
+                      <input
+                        ref={attachmentInputRef}
+                        type="file"
+                        accept=".pdf,image/png,image/jpeg,image/webp"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) {
+                            void handleUploadAttachment(file);
+                          }
+                          e.target.value = '';
+                        }}
+                      />
+                      <button
+                        type="button"
+                        disabled={uploadingAttachment}
+                        onClick={() => attachmentInputRef.current?.click()}
+                        className="min-h-[44px] min-w-[44px] rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-600 flex items-center justify-center shrink-0 disabled:opacity-50"
+                        aria-label="Attach PDF or image document (RTC, EC, Survey Sketch)"
+                        title="Attach PDF or image document"
+                      >
+                        <Paperclip className="w-4 h-4" />
+                      </button>
                       <input
                         type="text"
                         value={draftMessage}
                         onChange={(e) => handleTypingChange(e.target.value)}
-                        placeholder="Message securely inside this deal thread..."
-                        className="flex-1 h-11 px-4 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-[#008069]"
+                        placeholder={
+                          uploadingAttachment
+                            ? 'Uploading document...'
+                            : 'Message or attach RTC/EC/Survey PDF...'
+                        }
+                        className="flex-1 h-11 px-4 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-[#008069] min-w-0"
                       />
                       <button
                         type="submit"
-                        disabled={!draftMessage.trim()}
-                        className="min-h-[44px] min-w-[44px] px-4 rounded-xl bg-[#008069] hover:bg-[#075E54] text-white flex items-center justify-center gap-1.5 text-sm font-medium transition-colors disabled:opacity-40"
+                        disabled={!draftMessage.trim() || uploadingAttachment}
+                        className="min-h-[44px] min-w-[44px] px-4 rounded-xl bg-[#008069] hover:bg-[#075E54] text-white flex items-center justify-center gap-1.5 text-sm font-medium transition-colors disabled:opacity-40 shrink-0"
                         aria-label="Send message"
                       >
                         <Send className="w-4 h-4" />
@@ -2027,8 +2384,148 @@ export default function App() {
                     {currentUser.show_contact_after_consent ? 'Consent Enabled' : 'Strictly Masked'}
                   </button>
                 </div>
+
+                <div className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-[#111B21] flex items-center gap-1.5">
+                      <Bell className="w-4 h-4 text-[#008069]" />
+                      <span>Background Call & Message Alerts</span>
+                    </div>
+                    <p className="text-xs text-slate-500">
+                      Receive desktop or mobile browser alerts when new inquiries or calls arrive while this tab is in the background.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleToggleNotifications}
+                    className={`min-h-[44px] md:min-h-[40px] px-4 rounded-xl text-xs font-medium transition-colors self-start sm:self-center shrink-0 ${
+                      notificationsEnabled
+                        ? 'bg-[#008069] text-white'
+                        : 'bg-slate-100 text-slate-700'
+                    }`}
+                  >
+                    {notificationsEnabled ? 'Alerts Active' : 'Enable Alerts'}
+                  </button>
+                </div>
               </div>
             </div>
+
+            {/* Edit Profile & Security */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+              <form
+                onSubmit={handleSaveProfile}
+                className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-6 space-y-3.5"
+              >
+                <div className="flex items-center gap-2">
+                  <User className="w-4 h-4 text-[#008069]" />
+                  <h3 className="text-base font-semibold text-[#111B21]">Edit Profile</h3>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-600 mb-1">Display Name</label>
+                  <input
+                    type="text"
+                    required
+                    minLength={2}
+                    maxLength={80}
+                    value={profileName}
+                    onChange={(e) => setProfileName(e.target.value)}
+                    className="w-full h-11 px-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-[#008069]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-600 mb-1">City</label>
+                  <input
+                    type="text"
+                    maxLength={80}
+                    value={profileCity}
+                    onChange={(e) => setProfileCity(e.target.value)}
+                    className="w-full h-11 px-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-[#008069]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-600 mb-1">Bio / Credentials</label>
+                  <textarea
+                    rows={2}
+                    maxLength={300}
+                    value={profileBio}
+                    onChange={(e) => setProfileBio(e.target.value)}
+                    className="w-full p-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-[#008069]"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={profileSaving}
+                  className="min-h-[44px] px-4 rounded-xl bg-[#008069] hover:bg-[#075E54] text-white text-xs font-medium disabled:opacity-50"
+                >
+                  {profileSaving ? 'Saving...' : 'Save Profile'}
+                </button>
+              </form>
+
+              <form
+                onSubmit={handleChangePassword}
+                className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-6 space-y-3.5"
+              >
+                <div className="flex items-center gap-2">
+                  <KeyRound className="w-4 h-4 text-[#008069]" />
+                  <h3 className="text-base font-semibold text-[#111B21]">Change Password</h3>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-600 mb-1">Current Password</label>
+                  <input
+                    type="password"
+                    required
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    className="w-full h-11 px-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-[#008069]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-600 mb-1">New Password (8+ chars)</label>
+                  <input
+                    type="password"
+                    required
+                    minLength={8}
+                    maxLength={128}
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    className="w-full h-11 px-3 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-[#008069]"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={passwordSaving}
+                  className="min-h-[44px] px-4 rounded-xl border border-slate-200 hover:bg-slate-50 text-[#111B21] text-xs font-medium disabled:opacity-50"
+                >
+                  {passwordSaving ? 'Updating...' : 'Update Password'}
+                </button>
+              </form>
+            </div>
+
+            {blockedUsers.length > 0 && (
+              <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-6 space-y-3">
+                <div className="flex items-center gap-2">
+                  <Ban className="w-4 h-4 text-red-600" />
+                  <h3 className="text-base font-semibold text-[#111B21]">Blocked Accounts</h3>
+                </div>
+                <div className="divide-y divide-slate-100">
+                  {blockedUsers.map((bu) => (
+                    <div key={bu.user_uuid} className="py-2.5 flex items-center justify-between gap-3">
+                      <div className="text-sm text-[#111B21]">
+                        <span className="font-medium">{bu.display_name}</span>
+                        <span className="text-xs text-slate-500 ml-2">{bu.role}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleUnblockUser(bu.user_uuid)}
+                        className="min-h-[40px] px-3 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-medium text-slate-700"
+                      >
+                        Unblock
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </main>
@@ -2121,12 +2618,84 @@ export default function App() {
         <CallOverlay
           activeCall={activeCall}
           currentUserUuid={currentUser.user_uuid}
+          peerOnline={[activeCall.call.caller_uuid, ...activeCall.call.callee_uuids].some(
+            (id) => id !== currentUser.user_uuid && onlineUsers.has(id),
+          )}
           onAccept={handleAcceptCall}
           onReject={handleRejectCall}
           onEnd={handleEndCall}
           sendSignal={sendWebRtcSignal}
           incomingSignal={incomingSignal}
         />
+      )}
+
+      {reportingListing && (
+        <div
+          className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Report parcel listing"
+        >
+          <form
+            onSubmit={handleSubmitReport}
+            className="bg-white rounded-2xl border border-slate-200 w-full max-w-md p-5 space-y-4 shadow-xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-semibold text-[#111B21]">Report Parcel Listing</h3>
+                <p className="text-xs text-slate-500 mt-0.5 line-clamp-1">{reportingListing.title}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReportingListing(null)}
+                className="min-h-[40px] min-w-[40px] rounded-lg hover:bg-slate-100 flex items-center justify-center text-slate-500"
+                aria-label="Close report dialog"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Reason</label>
+              <select
+                value={reportReason}
+                onChange={(e) => setReportReason(e.target.value)}
+                className="w-full h-11 px-3 rounded-xl border border-slate-200 bg-white text-sm"
+              >
+                <option value="Misleading pricing or area details">Misleading pricing or area details</option>
+                <option value="Duplicate or spam listing">Duplicate or spam listing</option>
+                <option value="Disputed ownership or title issue">Disputed ownership or title issue</option>
+                <option value="Incorrect coordinates or zoning">Incorrect coordinates or zoning</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Additional Context</label>
+              <textarea
+                rows={3}
+                maxLength={500}
+                value={reportDetails}
+                onChange={(e) => setReportDetails(e.target.value)}
+                placeholder="Optional survey number or discrepancy notes..."
+                className="w-full p-3 rounded-xl border border-slate-200 text-sm"
+              />
+            </div>
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setReportingListing(null)}
+                className="min-h-[44px] px-4 rounded-xl border border-slate-200 text-xs font-medium text-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={reportSubmitting}
+                className="min-h-[44px] px-4 rounded-xl bg-red-600 hover:bg-red-700 text-white text-xs font-medium disabled:opacity-50"
+              >
+                {reportSubmitting ? 'Submitting...' : 'Submit Report'}
+              </button>
+            </div>
+          </form>
+        </div>
       )}
     </div>
   );

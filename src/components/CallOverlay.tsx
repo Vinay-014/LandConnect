@@ -6,6 +6,7 @@ import type { ActiveCallUiState, CallMode } from '../types';
 interface CallOverlayProps {
   activeCall: ActiveCallUiState;
   currentUserUuid: string;
+  peerOnline?: boolean;
   onAccept: (callId: string) => Promise<void>;
   onReject: (callId: string) => Promise<void>;
   onEnd: (callId: string) => Promise<void>;
@@ -124,6 +125,7 @@ function RemotePeerAudio({ stream }: { stream: MediaStream }) {
 export function CallOverlay({
   activeCall,
   currentUserUuid,
+  peerOnline,
   onAccept,
   onReject,
   onEnd,
@@ -133,6 +135,7 @@ export function CallOverlay({
   const { call, direction, peerName, peerRole, listingTitle, iceServers } = activeCall;
   const isConnected = call.state === 'CONNECTED';
   const isIncomingRinging = call.state === 'RINGING' && direction === 'INCOMING';
+  const shouldAcquireMedia = isConnected || (direction === 'OUTGOING' && call.state === 'RINGING');
 
   const [micMuted, setMicMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(call.mode === 'AUDIO');
@@ -141,6 +144,7 @@ export function CallOverlay({
   const [mediaNotice, setMediaNotice] = useState<string | null>(null);
   const [iceStatus, setIceStatus] = useState<string>('signaling');
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
+  const [mediaReadyVersion, setMediaReadyVersion] = useState(0);
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
@@ -159,10 +163,10 @@ export function CallOverlay({
   }, [call.mode]);
 
   useEffect(() => {
-    if (mode === 'VIDEO' && isConnected && localVideoRef.current && localStreamRef.current) {
+    if (mode === 'VIDEO' && shouldAcquireMedia && localVideoRef.current && localStreamRef.current) {
       localVideoRef.current.srcObject = localStreamRef.current;
     }
-  }, [mode, isConnected]);
+  }, [mode, shouldAcquireMedia, mediaReadyVersion]);
 
   useEffect(() => {
     if (!isConnected) {
@@ -263,12 +267,12 @@ export function CallOverlay({
     }
   };
 
-  // Setup multi-peer WebRTC mesh when CONNECTED
+  // Acquire local audio/video immediately on outgoing call or when connected
   useEffect(() => {
-    if (!isConnected) return;
+    if (!shouldAcquireMedia) return;
     let cancelled = false;
 
-    async function setupMesh() {
+    async function acquireMedia() {
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
@@ -293,9 +297,32 @@ export function CallOverlay({
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
       }
+      setMediaReadyVersion((v) => v + 1);
+    }
 
+    void acquireMedia();
+
+    return () => {
+      cancelled = true;
+      syntheticIntervalsRef.current.forEach((id) => clearInterval(id));
+      syntheticIntervalsRef.current = [];
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((t) => t.stop());
+        localStreamRef.current = null;
+      }
+    };
+  }, [shouldAcquireMedia, call.call_id]);
+
+  // Setup multi-peer WebRTC mesh once CONNECTED and local media is ready
+  useEffect(() => {
+    const stream = localStreamRef.current;
+    if (!isConnected || !stream) return;
+    let cancelled = false;
+
+    async function setupMesh(activeStream: MediaStream) {
       for (const peerUuid of remotePeerUuids) {
-        const pc = getOrCreatePeerConnection(peerUuid, stream);
+        if (cancelled) return;
+        const pc = getOrCreatePeerConnection(peerUuid, activeStream);
         // Deterministic offerer tie-breaker avoids SDP glare in 2- and 3-party calls
         if (currentUserUuid < peerUuid && pc.signalingState === 'stable') {
           const offer = await pc.createOffer();
@@ -311,11 +338,12 @@ export function CallOverlay({
       // Flush any SDP/ICE signals that arrived while getUserMedia was resolving
       const buffered = queuedSignalsRef.current.splice(0);
       for (const sig of buffered) {
-        await processSignal(sig.event, sig.payload, stream).catch(() => {});
+        if (cancelled) return;
+        await processSignal(sig.event, sig.payload, activeStream).catch(() => {});
       }
     }
 
-    setupMesh();
+    void setupMesh(stream);
 
     return () => {
       cancelled = true;
@@ -326,14 +354,8 @@ export function CallOverlay({
       pendingIceRef.current.clear();
       queuedSignalsRef.current = [];
       setRemoteStreams({});
-      syntheticIntervalsRef.current.forEach((id) => clearInterval(id));
-      syntheticIntervalsRef.current = [];
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t) => t.stop());
-        localStreamRef.current = null;
-      }
     };
-  }, [isConnected, call.call_id]);
+  }, [isConnected, call.call_id, mediaReadyVersion]);
 
   // Handle incoming targeted SDP/ICE signals (buffering if localStream is still initializing)
   useEffect(() => {
@@ -544,21 +566,28 @@ export function CallOverlay({
           </div>
         )}
 
-        {mode === 'VIDEO' && isConnected && (
+        {mode === 'VIDEO' && shouldAcquireMedia && (
           <video
             ref={localVideoRef}
             autoPlay
             playsInline
             muted
-            className="absolute bottom-3 right-3 sm:bottom-5 sm:right-5 w-24 sm:w-44 aspect-[4/3] rounded-xl object-cover border border-white/20 bg-black shadow-lg"
+            className="absolute bottom-3 right-3 sm:bottom-5 sm:right-5 w-28 sm:w-44 aspect-[4/3] rounded-xl object-cover border border-white/20 bg-black shadow-lg"
           />
         )}
 
-        {mediaNotice && (
-          <div className="absolute top-3 left-3 right-3 sm:top-4 sm:left-4 sm:right-auto bg-black/75 text-slate-200 text-xs px-3 py-1.5 rounded-lg">
-            {mediaNotice}
-          </div>
-        )}
+        <div className="absolute top-3 left-3 right-3 sm:top-4 sm:left-4 sm:right-auto flex flex-col gap-2 max-w-md">
+          {direction === 'OUTGOING' && call.state === 'RINGING' && peerOnline === false && (
+            <div className="bg-amber-950/90 border border-amber-500/40 text-amber-100 text-xs px-3 py-2 rounded-lg leading-relaxed">
+              {peerName} is currently offline. Live audio/video rings and connects when the recipient is signed in on another browser tab or device.
+            </div>
+          )}
+          {mediaNotice && (
+            <div className="bg-black/75 text-slate-200 text-xs px-3 py-1.5 rounded-lg">
+              {mediaNotice}
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="max-w-lg w-full mx-auto flex items-center justify-center flex-wrap sm:flex-nowrap gap-2.5 sm:gap-4 pb-1 sm:pb-2">

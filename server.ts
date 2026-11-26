@@ -6,19 +6,24 @@ import http from 'http';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { WebSocketServer, type WebSocket } from 'ws';
+import zlib from 'zlib';
 import { CallSignalingEngine, callEngine as defaultCallEngine } from './server/callEngine.ts';
 import { metrics } from './server/metrics.ts';
 import {
   SlidingWindowRateLimiter,
-  hashPassword,
+  hashPasswordAsync,
   issueAccessToken,
   issueRefreshToken,
   toPrivacySafeProfile,
   verifyAccessToken,
-  verifyPassword,
+  verifyPasswordAsync,
   verifyRefreshToken,
   type AccessTokenPayload,
 } from './server/security.ts';
+import {
+  LocalDiskStorageProvider,
+  type StorageProvider,
+} from './server/storage.ts';
 import { db as defaultStore, type SqliteStore } from './server/store.ts';
 import type {
   CallMode,
@@ -26,6 +31,7 @@ import type {
   ChatRoom,
   LandListing,
   LandType,
+  ListingReport,
   UserRecord,
   UserRole,
 } from './server/types.ts';
@@ -37,6 +43,7 @@ import {
   isValidEmail,
   isValidPhone,
   isValidPolygonGeoJson,
+  verifyAttachmentMagicBytes,
   verifyImageMagicBytes,
 } from './server/validation.ts';
 
@@ -84,17 +91,77 @@ export function createLandConnectApp(options?: {
   store?: SqliteStore;
   callEngine?: CallSignalingEngine;
   uploadsDir?: string;
+  storage?: StorageProvider;
+  isShuttingDown?: () => boolean;
 }) {
   const store = options?.store ?? defaultStore;
   const engine = options?.callEngine ?? defaultCallEngine;
+  const isShuttingDown = options?.isShuttingDown ?? (() => false);
   const uploadsDir = options?.uploadsDir ?? path.resolve(process.cwd(), 'uploads');
   if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
   }
+  const storage = options?.storage ?? new LocalDiskStorageProvider(uploadsDir);
+  const isDemoAuthEnabled = () => process.env.ENABLE_DEMO_AUTH !== 'false';
 
   const rateLimiter = new SlidingWindowRateLimiter();
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '10mb' }));
+
+  // Lightweight native gzip compression for JSON & text responses >= 1 KB
+  app.use((req, res, next) => {
+    res.vary('Accept-Encoding');
+    const accept = String(req.headers['accept-encoding'] || '');
+    if (req.method === 'HEAD' || !/\bgzip\b/i.test(accept)) {
+      next();
+      return;
+    }
+    const origSend = res.send.bind(res);
+    res.send = ((body?: unknown) => {
+      if (
+        res.headersSent ||
+        res.statusCode === 204 ||
+        res.statusCode === 304 ||
+        res.getHeader('Content-Encoding')
+      ) {
+        return origSend(body);
+      }
+      const contentType = String(res.getHeader('Content-Type') || '');
+      const isCompressible =
+        !contentType ||
+        contentType.startsWith('application/json') ||
+        contentType.startsWith('text/') ||
+        contentType.startsWith('application/javascript') ||
+        contentType.startsWith('image/svg+xml');
+      if (!isCompressible) {
+        return origSend(body);
+      }
+      const buf = Buffer.isBuffer(body)
+        ? body
+        : typeof body === 'string'
+          ? Buffer.from(body, 'utf8')
+          : null;
+      if (!buf || buf.length < 1024) {
+        return origSend(body);
+      }
+      if (!contentType && typeof body === 'string') {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      }
+      zlib.gzip(buf, (err, compressed) => {
+        if (err || res.headersSent) {
+          if (!res.headersSent) origSend(body);
+          return;
+        }
+        res.removeHeader('Content-Length');
+        res.setHeader('Content-Encoding', 'gzip');
+        res.setHeader('Content-Length', String(compressed.length));
+        origSend(compressed);
+      });
+      return res;
+    }) as express.Response['send'];
+    next();
+  });
 
   // Reconcile any orphaned call sessions from a previous server crash/restart
   engine.reconcileOnBoot();
@@ -160,6 +227,8 @@ export function createLandConnectApp(options?: {
     res.setHeader('X-Request-ID', reqId);
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=(self)');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
     const start = Date.now();
     res.on('finish', () => {
       if (req.path.startsWith('/api') || req.path.startsWith('/health')) {
@@ -180,7 +249,21 @@ export function createLandConnectApp(options?: {
     next();
   });
 
-  app.get('/metrics', (_req, res) => {
+  app.get('/metrics', (req, res) => {
+    const expectedToken = process.env.METRICS_TOKEN?.trim();
+    if (expectedToken) {
+      const authHeader = req.headers.authorization || '';
+      const provided = authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length).trim() : '';
+      const expectedBuf = Buffer.from(expectedToken, 'utf8');
+      const providedBuf = Buffer.from(provided, 'utf8');
+      if (
+        expectedBuf.length !== providedBuf.length ||
+        !crypto.timingSafeEqual(expectedBuf, providedBuf)
+      ) {
+        res.status(401).json({ detail: 'Metrics authentication required' });
+        return;
+      }
+    }
     const stats = store.getHealthStats();
     res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
     res.send(
@@ -199,10 +282,41 @@ export function createLandConnectApp(options?: {
     express.static(uploadsDir, {
       setHeaders: (res) => {
         res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Content-Disposition', 'inline');
         res.setHeader('Cache-Control', 'public, max-age=86400');
       },
     }),
   );
+
+  // Liveness & Readiness Probes (Kubernetes / container orchestrator compatible)
+  app.get('/health/live', (_req, res) => {
+    res.json({
+      status: 'alive',
+      uptime_sec: Math.round(process.uptime()),
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.get('/health/ready', (_req, res) => {
+    if (isShuttingDown()) {
+      res.status(503).json({ status: 'draining', timestamp: new Date().toISOString() });
+      return;
+    }
+    try {
+      const stats = store.getHealthStats();
+      if (!stats.ok) {
+        res.status(503).json({ status: 'not_ready', timestamp: new Date().toISOString() });
+        return;
+      }
+      res.json({
+        status: 'ready',
+        journal_mode: stats.journal_mode,
+        timestamp: new Date().toISOString(),
+      });
+    } catch {
+      res.status(503).json({ status: 'not_ready', timestamp: new Date().toISOString() });
+    }
+  });
 
   // Deep Health Check (Transactional SQLite WAL + spatial bounds + live WebSocket hub)
   app.get('/health/deep', (_req, res) => {
@@ -235,7 +349,7 @@ export function createLandConnectApp(options?: {
     }
   });
 
-  // Public Google Maps Platform client configuration (browser-scoped key only)
+  // Public Google Maps Platform & runtime feature flags (browser-scoped only)
   app.get('/api/v1/config/maps', (_req, res) => {
     const apiKey =
       process.env.VITE_GOOGLE_MAPS_API_KEY ||
@@ -244,13 +358,25 @@ export function createLandConnectApp(options?: {
     res.json({
       apiKey,
       configured: Boolean(apiKey),
+      demoAuthEnabled: isDemoAuthEnabled(),
+    });
+  });
+
+  app.get('/api/v1/config/public', (_req, res) => {
+    const apiKey =
+      process.env.VITE_GOOGLE_MAPS_API_KEY ||
+      process.env.GOOGLE_MAPS_API_KEY ||
+      '';
+    res.json({
+      mapsConfigured: Boolean(apiKey),
+      demoAuthEnabled: isDemoAuthEnabled(),
     });
   });
 
   // ------------------------------------------------------------------
   // 1. AUTHENTICATION, DEMO SWITCHER, RBAC & PRIVACY LAYER
   // ------------------------------------------------------------------
-  app.post('/api/v1/auth/register', applyRateLimit('auth_register', 15, 60_000), (req, res) => {
+  app.post('/api/v1/auth/register', applyRateLimit('auth_register', 15, 60_000), async (req, res) => {
     const { email, phone, password, display_name, role, city, bio } = req.body ?? {};
     const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
     const passwordStr = typeof password === 'string' ? password : '';
@@ -282,11 +408,12 @@ export function createLandConnectApp(options?: {
       return;
     }
 
+    const passwordHash = await hashPasswordAsync(passwordStr);
     const user: UserRecord = {
       user_uuid: `usr_${String(role).toLowerCase()}_${crypto.randomBytes(5).toString('hex')}`,
       email: normalizedEmail,
       phone: phoneStr,
-      password_hash: hashPassword(passwordStr),
+      password_hash: passwordHash,
       display_name: nameStr,
       role,
       city: clampString(city, 80, 'Bengaluru') || 'Bengaluru',
@@ -315,14 +442,14 @@ export function createLandConnectApp(options?: {
     });
   });
 
-  app.post('/api/v1/auth/login', applyRateLimit('auth_login', 30, 60_000), (req, res) => {
+  app.post('/api/v1/auth/login', applyRateLimit('auth_login', 30, 60_000), async (req, res) => {
     const { email, password } = req.body ?? {};
     if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
       res.status(400).json({ detail: 'email and password are required' });
       return;
     }
     const user = store.findUserByEmail(email.trim());
-    if (!user || !verifyPassword(password, user.password_hash)) {
+    if (!user || !(await verifyPasswordAsync(password, user.password_hash))) {
       res.status(401).json({ detail: 'Invalid email or password' });
       return;
     }
@@ -336,8 +463,12 @@ export function createLandConnectApp(options?: {
     });
   });
 
-  // 1-Click Evaluator Demo Role Switcher (explicitly scoped to seeded is_demo = 1 profiles)
+  // 1-Click Evaluator Demo Role Switcher (explicitly scoped to seeded is_demo = 1 profiles and gated by ENABLE_DEMO_AUTH)
   app.post('/api/v1/auth/demo-login', applyRateLimit('auth_demo', 40, 60_000), (req, res) => {
+    if (!isDemoAuthEnabled()) {
+      res.status(403).json({ detail: 'Demo workspace login is disabled in this environment' });
+      return;
+    }
     const { role } = req.body ?? {};
     if (!VALID_ROLES.includes(role)) {
       res.status(400).json({ detail: 'role must be BUYER, SELLER, or BROKER' });
@@ -441,15 +572,121 @@ export function createLandConnectApp(options?: {
     res.json(toPrivacySafeProfile(updated, updated.user_uuid, online));
   });
 
+  app.patch('/api/v1/auth/profile', requireAuth, (req, res) => {
+    const { display_name, city, bio } = req.body ?? {};
+    const nextName = display_name !== undefined ? clampString(display_name, 80) : undefined;
+    const nextCity = city !== undefined ? clampString(city, 80) : undefined;
+    const nextBio = bio !== undefined ? clampString(bio, 300) : undefined;
+
+    if (nextName !== undefined && nextName.length < 2) {
+      res.status(400).json({ detail: 'Display name must be at least 2 characters' });
+      return;
+    }
+    const updated = store.updateUserProfile(req.auth!.sub, {
+      display_name: nextName,
+      city: nextCity,
+      bio: nextBio,
+    });
+    if (!updated) {
+      res.status(404).json({ detail: 'User not found' });
+      return;
+    }
+    res.json(toPrivacySafeProfile(updated, updated.user_uuid, engine.getOnlineUserUuids()));
+  });
+
+  app.post('/api/v1/auth/change-password', requireAuth, applyRateLimit('auth_pw', 10, 60_000), async (req, res) => {
+    const { current_password, new_password } = req.body ?? {};
+    if (typeof current_password !== 'string' || typeof new_password !== 'string') {
+      res.status(400).json({ detail: 'current_password and new_password are required' });
+      return;
+    }
+    if (new_password.length < 8 || new_password.length > 128) {
+      res.status(400).json({ detail: 'New password must be between 8 and 128 characters' });
+      return;
+    }
+    const user = store.findUserByUuid(req.auth!.sub);
+    if (!user) {
+      res.status(404).json({ detail: 'User not found' });
+      return;
+    }
+    if (!(await verifyPasswordAsync(current_password, user.password_hash))) {
+      res.status(401).json({ detail: 'Current password is incorrect' });
+      return;
+    }
+    store.updateUserPassword(user.user_uuid, await hashPasswordAsync(new_password));
+    res.json({ status: 'ok' });
+  });
+
   app.get('/api/v1/users', requireAuth, (req, res) => {
     const online = engine.getOnlineUserUuids();
-    const profiles = store.listUsers().map((u) => toPrivacySafeProfile(u, req.auth!.sub, online));
-    res.json({ users: profiles });
+    const q = typeof req.query.q === 'string' ? req.query.q : undefined;
+    const limit =
+      req.query.limit !== undefined ? Math.min(500, Math.max(1, Number(req.query.limit) || 100)) : 100;
+    const offset = req.query.offset !== undefined ? Math.max(0, Number(req.query.offset) || 0) : 0;
+    const { items, total } = store.listUsersPage({ q, limit, offset });
+    const profiles = items.map((u) => toPrivacySafeProfile(u, req.auth!.sub, online));
+    res.json({
+      users: profiles,
+      total,
+      limit,
+      offset,
+      has_more: offset + profiles.length < total,
+    });
+  });
+
+  app.get('/api/v1/users/blocked', requireAuth, (req, res) => {
+    const blockedIds = store.listBlockedUsers(req.auth!.sub);
+    const online = engine.getOnlineUserUuids();
+    const blockedMap = store.findUsersByUuids(blockedIds);
+    const blockedProfiles = blockedIds
+      .map((id) => blockedMap.get(id))
+      .filter((u): u is UserRecord => Boolean(u))
+      .map((u) => toPrivacySafeProfile(u, req.auth!.sub, online));
+    res.json({ blocked_uuids: blockedIds, blocked_users: blockedProfiles });
+  });
+
+  app.post('/api/v1/users/:userUuid/block', requireAuth, (req, res) => {
+    const targetUuid = req.params.userUuid;
+    if (targetUuid === req.auth!.sub) {
+      res.status(400).json({ detail: 'You cannot block your own account' });
+      return;
+    }
+    const reason = clampString(req.body?.reason, 240);
+    const ok = store.blockUser(req.auth!.sub, targetUuid, reason);
+    if (!ok) {
+      res.status(404).json({ detail: 'Target user not found' });
+      return;
+    }
+    res.status(201).json({ status: 'blocked', blocked_uuid: targetUuid });
+  });
+
+  app.delete('/api/v1/users/:userUuid/block', requireAuth, (req, res) => {
+    store.unblockUser(req.auth!.sub, req.params.userUuid);
+    res.json({ status: 'unblocked', unblocked_uuid: req.params.userUuid });
   });
 
   // ------------------------------------------------------------------
   // 2. GEOSPATIAL SEARCH & LISTINGS CRUD (ACID + OPTIMISTIC CONCURRENCY)
   // ------------------------------------------------------------------
+  function enrichListingsWithProfiles(items: LandListing[], viewerUuid: string) {
+    const online = engine.getOnlineUserUuids();
+    const userIds: string[] = [];
+    for (const l of items) {
+      userIds.push(l.owner_uuid);
+      if (l.broker_uuid) userIds.push(l.broker_uuid);
+    }
+    const userMap = store.findUsersByUuids(userIds);
+    return items.map((l) => {
+      const owner = userMap.get(l.owner_uuid);
+      const broker = l.broker_uuid ? userMap.get(l.broker_uuid) : undefined;
+      return {
+        ...l,
+        owner_profile: owner ? toPrivacySafeProfile(owner, viewerUuid, online) : null,
+        broker_profile: broker ? toPrivacySafeProfile(broker, viewerUuid, online) : null,
+      };
+    });
+  }
+
   app.get('/api/v1/listings/nearby', requireAuth, (req, res) => {
     const lat = Number(req.query.lat);
     const lng = Number(req.query.lng);
@@ -459,16 +696,7 @@ export function createLandConnectApp(options?: {
       return;
     }
     const items = store.queryListingsNearby(lat, lng, radiusKm);
-    const online = engine.getOnlineUserUuids();
-    const enriched = items.map((l) => {
-      const owner = store.findUserByUuid(l.owner_uuid);
-      const broker = l.broker_uuid ? store.findUserByUuid(l.broker_uuid) : undefined;
-      return {
-        ...l,
-        owner_profile: owner ? toPrivacySafeProfile(owner, req.auth!.sub, online) : null,
-        broker_profile: broker ? toPrivacySafeProfile(broker, req.auth!.sub, online) : null,
-      };
-    });
+    const enriched = enrichListingsWithProfiles(items, req.auth!.sub);
 
     res.json({
       query: { lat, lng, radius_km: radiusKm },
@@ -487,16 +715,7 @@ export function createLandConnectApp(options?: {
       return;
     }
     const items = store.queryListingsBbox(minLng, minLat, maxLng, maxLat);
-    const online = engine.getOnlineUserUuids();
-    const enriched = items.map((l) => {
-      const owner = store.findUserByUuid(l.owner_uuid);
-      const broker = l.broker_uuid ? store.findUserByUuid(l.broker_uuid) : undefined;
-      return {
-        ...l,
-        owner_profile: owner ? toPrivacySafeProfile(owner, req.auth!.sub, online) : null,
-        broker_profile: broker ? toPrivacySafeProfile(broker, req.auth!.sub, online) : null,
-      };
-    });
+    const enriched = enrichListingsWithProfiles(items, req.auth!.sub);
     res.json({
       query: { min_lng: minLng, min_lat: minLat, max_lng: maxLng, max_lat: maxLat },
       count: enriched.length,
@@ -508,11 +727,13 @@ export function createLandConnectApp(options?: {
   app.get('/api/v1/public/listings', (req, res) => {
     const landType = typeof req.query.land_type === 'string' ? req.query.land_type : undefined;
     const city = typeof req.query.city === 'string' ? req.query.city : undefined;
+    const limitNum = req.query.limit !== undefined ? Math.min(100, Math.max(1, Number(req.query.limit) || 24)) : 24;
+    const offsetNum = req.query.offset !== undefined ? Math.max(0, Number(req.query.offset) || 0) : 0;
     const sort =
       req.query.sort === 'price_asc' || req.query.sort === 'price_desc'
         ? req.query.sort
         : 'price_asc';
-    const { items } = store.queryListings({ landType, city, sort, limit: 24, offset: 0 });
+    const { items, total } = store.queryListings({ landType, city, sort, limit: limitNum, offset: offsetNum });
     const sanitized = items.map((l) => ({
       id: l.id,
       title: l.title,
@@ -527,15 +748,23 @@ export function createLandConnectApp(options?: {
       city: l.city,
       images: l.images,
     }));
-    res.json({ count: sanitized.length, listings: sanitized });
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+    res.json({
+      count: sanitized.length,
+      total,
+      limit: limitNum,
+      offset: offsetNum,
+      has_more: offsetNum + sanitized.length < total,
+      listings: sanitized,
+    });
   });
 
   app.get('/api/v1/listings', requireAuth, (req, res) => {
     const { land_type, city, min_price, max_price, q, sort, limit, offset } = req.query;
     const minPriceNum = min_price !== undefined ? Number(min_price) : undefined;
     const maxPriceNum = max_price !== undefined ? Number(max_price) : undefined;
-    const limitNum = limit !== undefined ? Number(limit) : 50;
-    const offsetNum = offset !== undefined ? Number(offset) : 0;
+    const limitNum = limit !== undefined ? Math.min(100, Math.max(1, Number(limit) || 50)) : 50;
+    const offsetNum = offset !== undefined ? Math.max(0, Number(offset) || 0) : 0;
     const sortMode =
       sort === 'price_asc' || sort === 'price_desc' || sort === 'updated_desc'
         ? sort
@@ -548,21 +777,19 @@ export function createLandConnectApp(options?: {
       maxPrice: Number.isFinite(maxPriceNum) ? maxPriceNum : undefined,
       q: typeof q === 'string' ? q : undefined,
       sort: sortMode,
-      limit: Number.isFinite(limitNum) ? limitNum : 50,
-      offset: Number.isFinite(offsetNum) ? offsetNum : 0,
+      limit: limitNum,
+      offset: offsetNum,
     });
 
-    const online = engine.getOnlineUserUuids();
-    const enriched = items.map((l) => {
-      const owner = store.findUserByUuid(l.owner_uuid);
-      const broker = l.broker_uuid ? store.findUserByUuid(l.broker_uuid) : undefined;
-      return {
-        ...l,
-        owner_profile: owner ? toPrivacySafeProfile(owner, req.auth!.sub, online) : null,
-        broker_profile: broker ? toPrivacySafeProfile(broker, req.auth!.sub, online) : null,
-      };
+    const enriched = enrichListingsWithProfiles(items, req.auth!.sub);
+    res.json({
+      count: enriched.length,
+      total,
+      limit: limitNum,
+      offset: offsetNum,
+      has_more: offsetNum + enriched.length < total,
+      listings: enriched,
     });
-    res.json({ count: enriched.length, total, listings: enriched });
   });
 
   app.post(
@@ -757,11 +984,40 @@ export function createLandConnectApp(options?: {
   );
 
   app.post(
+    '/api/v1/listings/:id/report',
+    requireAuth,
+    applyRateLimit('listing_report', 10, 60_000),
+    (req, res) => {
+      const listing = store.findListingById(req.params.id);
+      if (!listing) {
+        res.status(404).json({ detail: 'Listing not found' });
+        return;
+      }
+      const reason = clampString(req.body?.reason, 120);
+      if (reason.length < 3) {
+        res.status(400).json({ detail: 'A valid report reason is required' });
+        return;
+      }
+      const details = clampString(req.body?.details, 500);
+      const report: ListingReport = {
+        id: `rep_${crypto.randomBytes(6).toString('hex')}`,
+        listing_id: listing.id,
+        reporter_uuid: req.auth!.sub,
+        reason,
+        details,
+        created_at: new Date().toISOString(),
+      };
+      store.createListingReport(report);
+      res.status(201).json(report);
+    },
+  );
+
+  app.post(
     '/api/v1/listings/upload-image',
     requireAuth,
     requireRoles('SELLER', 'BROKER'),
     applyRateLimit('upload_image', 20, 60_000),
-    (req, res) => {
+    async (req, res) => {
       const { filename, data_url } = req.body ?? {};
       if (!filename || typeof data_url !== 'string' || !data_url.startsWith('data:image/')) {
         res.status(400).json({ detail: 'Valid base64 image data_url and filename are required' });
@@ -783,14 +1039,8 @@ export function createLandConnectApp(options?: {
         return;
       }
 
-      const safeName = `parcel_${crypto.randomBytes(6).toString('hex')}.${ext}`;
-      const targetPath = path.resolve(uploadsDir, safeName);
-      if (!targetPath.startsWith(uploadsDir + path.sep)) {
-        res.status(400).json({ detail: 'Invalid upload destination' });
-        return;
-      }
-      fs.writeFileSync(targetPath, decoded);
-      res.status(201).json({ url: `/uploads/${safeName}` });
+      const saved = await storage.saveBuffer({ prefix: 'parcel', ext, buffer: decoded });
+      res.status(201).json({ url: saved.url });
     },
   );
 
@@ -806,6 +1056,21 @@ export function createLandConnectApp(options?: {
         return;
       }
 
+      const customFocus =
+        typeof req.body?.focus === 'string' ? req.body.focus.trim().slice(0, 240) : '';
+      const focusKey = customFocus.toLowerCase();
+      const ttlHours = Math.max(1, Number(process.env.GROUNDING_CACHE_TTL_HOURS || 12) || 12);
+      const forceRefresh = req.body?.force_refresh === true;
+
+      if (!forceRefresh) {
+        const cachedInsights = store.getGroundingCache(listing.id, focusKey, ttlHours);
+        if (cachedInsights) {
+          res.setHeader('X-Cache', 'HIT');
+          res.json(cachedInsights);
+          return;
+        }
+      }
+
       const geminiApiKey = process.env.GEMINI_API_KEY;
       if (!geminiApiKey) {
         res.status(503).json({
@@ -814,8 +1079,6 @@ export function createLandConnectApp(options?: {
         return;
       }
 
-      const customFocus =
-        typeof req.body?.focus === 'string' ? req.body.focus.trim().slice(0, 240) : '';
       const ai = new GoogleGenAI({
         apiKey: geminiApiKey,
         httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
@@ -917,7 +1180,7 @@ export function createLandConnectApp(options?: {
           }
         }
 
-        res.json({
+        const responsePayload = {
           listing_id: listing.id,
           model: 'gemini-4-hydrogen',
           generated_at: new Date().toISOString(),
@@ -933,7 +1196,14 @@ export function createLandConnectApp(options?: {
               ? 'Nearby Maps place summary is temporarily unavailable due to API quota.'
               : ''),
           maps_sources: mapsSources,
-        });
+        };
+
+        if (searchOutcome.status === 'fulfilled' && mapsOutcome.status === 'fulfilled') {
+          store.setGroundingCache(listing.id, focusKey, responsePayload);
+        }
+
+        res.setHeader('X-Cache', 'MISS');
+        res.json(responsePayload);
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Grounding request failed';
         const isQuota =
@@ -955,9 +1225,11 @@ export function createLandConnectApp(options?: {
   app.get('/api/v1/chats', requireAuth, (req, res) => {
     const viewerUuid = req.auth!.sub;
     const online = engine.getOnlineUserUuids();
-    const summaries = store.listChatsForUser(viewerUuid).map(({ room, listing, last_message, unread_count }) => {
+    const rows = store.listChatsForUser(viewerUuid);
+    const userMap = store.findUsersByUuids(rows.flatMap((r) => r.room.participant_uuids));
+    const summaries = rows.map(({ room, listing, last_message, unread_count }) => {
       const participants = room.participant_uuids
-        .map((uid) => store.findUserByUuid(uid))
+        .map((uid) => userMap.get(uid))
         .filter((u): u is UserRecord => Boolean(u))
         .map((u) => toPrivacySafeProfile(u, viewerUuid, online));
       return {
@@ -988,6 +1260,10 @@ export function createLandConnectApp(options?: {
     const targetUser = store.findUserByUuid(targetUuid);
     if (!targetUser) {
       res.status(404).json({ detail: 'Peer account not found' });
+      return;
+    }
+    if (store.isBlockedBetween(viewerUuid, targetUuid)) {
+      res.status(403).json({ detail: 'Messaging is unavailable because a participant block is active' });
       return;
     }
     const existing = store.findDirectChat(listing.id, viewerUuid, targetUuid);
@@ -1138,6 +1414,15 @@ export function createLandConnectApp(options?: {
         res.status(404).json({ detail: 'Chat room not found or access denied' });
         return;
       }
+      if (
+        room.room_type === 'DIRECT' &&
+        room.participant_uuids.some(
+          (id) => id !== req.auth!.sub && store.isBlockedBetween(req.auth!.sub, id),
+        )
+      ) {
+        res.status(403).json({ detail: 'Messaging is unavailable because a participant block is active' });
+        return;
+      }
       const bodyText = clampString(req.body?.body, 2000);
       if (!bodyText) {
         res.status(400).json({ detail: 'Message body cannot be empty' });
@@ -1161,6 +1446,91 @@ export function createLandConnectApp(options?: {
       };
       store.createMessage(msg);
 
+      engine.sendToUsers(room.participant_uuids, {
+        event: 'chat.message',
+        payload: msg,
+      });
+      res.status(201).json(msg);
+    },
+  );
+
+  app.post(
+    '/api/v1/chats/:roomId/attachments',
+    requireAuth,
+    applyRateLimit('chat_attach', 20, 60_000),
+    async (req, res) => {
+      const room = store.findChatRoomById(req.params.roomId);
+      if (!room || !room.participant_uuids.includes(req.auth!.sub)) {
+        res.status(404).json({ detail: 'Chat room not found or access denied' });
+        return;
+      }
+      if (
+        room.room_type === 'DIRECT' &&
+        room.participant_uuids.some(
+          (id) => id !== req.auth!.sub && store.isBlockedBetween(req.auth!.sub, id),
+        )
+      ) {
+        res.status(403).json({ detail: 'Messaging is unavailable because a participant block is active' });
+        return;
+      }
+
+      const { filename, data_url, body } = req.body ?? {};
+      const cleanName = clampString(filename, 120, 'document');
+      if (!cleanName || typeof data_url !== 'string') {
+        res.status(400).json({ detail: 'Valid filename and base64 data_url are required' });
+        return;
+      }
+
+      const match = data_url.match(
+        /^data:(application\/pdf|image\/png|image\/jpeg|image\/jpg|image\/webp);base64,([A-Za-z0-9+/=]+)$/,
+      );
+      if (!match) {
+        res.status(400).json({ detail: 'Unsupported attachment format. Allowed: PDF, PNG, JPEG, WEBP' });
+        return;
+      }
+
+      const mime = match[1];
+      const ext = (
+        mime === 'application/pdf'
+          ? 'pdf'
+          : mime === 'image/jpeg' || mime === 'image/jpg'
+          ? 'jpg'
+          : mime === 'image/png'
+          ? 'png'
+          : 'webp'
+      ) as 'png' | 'jpg' | 'webp' | 'pdf';
+
+      const decoded = Buffer.from(match[2], 'base64');
+      if (decoded.length === 0 || decoded.length > MAX_UPLOAD_BYTES) {
+        res.status(400).json({ detail: 'Attachment file size must be under 5 MB' });
+        return;
+      }
+      if (!verifyAttachmentMagicBytes(decoded, ext)) {
+        res.status(400).json({ detail: 'File bytes do not match declared attachment format' });
+        return;
+      }
+
+      const saved = await storage.saveBuffer({ subdir: 'attachments', prefix: 'doc', ext, buffer: decoded });
+      const online = engine.getOnlineUserUuids();
+      const anyRecipientOnline = room.participant_uuids.some(
+        (id) => id !== req.auth!.sub && online.has(id),
+      );
+      const now = new Date().toISOString();
+      const caption = clampString(body, 500) || `Shared document: ${cleanName}`;
+      const msg: ChatMessage = {
+        id: `msg_${crypto.randomBytes(6).toString('hex')}`,
+        room_id: room.id,
+        sender_uuid: req.auth!.sub,
+        message_type: 'TEXT',
+        body: caption,
+        attachment_url: saved.url,
+        attachment_name: cleanName,
+        attachment_type: mime === 'image/jpg' ? 'image/jpeg' : mime,
+        delivery_state: anyRecipientOnline ? 'DELIVERED' : 'SENT',
+        read_by_uuids: [req.auth!.sub],
+        created_at: now,
+      };
+      store.createMessage(msg);
       engine.sendToUsers(room.participant_uuids, {
         event: 'chat.message',
         payload: msg,
@@ -1297,13 +1667,20 @@ export function createLandConnectApp(options?: {
   app.get('/api/v1/calls/logs', requireAuth, (req, res) => {
     const viewerUuid = req.auth!.sub;
     const online = engine.getOnlineUserUuids();
-    const logs = store.getCallLogsForUser(viewerUuid, 50).map((c) => {
-      const caller = store.findUserByUuid(c.caller_uuid);
+    const rawLogs = store.getCallLogsForUser(viewerUuid, 50);
+    const userMap = store.findUsersByUuids(
+      rawLogs.flatMap((c) => [c.caller_uuid, ...c.callee_uuids]),
+    );
+    const listingMap = store.findListingsByIds(
+      rawLogs.map((c) => c.listing_id).filter((id): id is string => Boolean(id)),
+    );
+    const logs = rawLogs.map((c) => {
+      const caller = userMap.get(c.caller_uuid);
       const callees = c.callee_uuids
-        .map((id) => store.findUserByUuid(id))
+        .map((id) => userMap.get(id))
         .filter((u): u is UserRecord => Boolean(u))
         .map((u) => toPrivacySafeProfile(u, viewerUuid, online));
-      const listing = c.listing_id ? store.findListingById(c.listing_id) : undefined;
+      const listing = c.listing_id ? listingMap.get(c.listing_id) : undefined;
       return {
         ...c,
         direction: c.caller_uuid === viewerUuid ? 'OUTGOING' : 'INCOMING',
@@ -1421,7 +1798,10 @@ export function attachWebSocketHub(
 
 async function startServer() {
   const PORT = Number(process.env.PORT || 3000);
-  const { app, store, engine } = createLandConnectApp();
+  let isShuttingDown = false;
+  const { app, store, engine } = createLandConnectApp({
+    isShuttingDown: () => isShuttingDown,
+  });
   const server = http.createServer(app);
   const { wss, heartbeatTimer } = attachWebSocketHub(server, store, engine);
 
@@ -1433,8 +1813,24 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
+    app.use(
+      '/assets',
+      express.static(path.join(distDir, 'assets'), {
+        maxAge: '1y',
+        immutable: true,
+      }),
+    );
+    app.use(
+      express.static(distDir, {
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('index.html')) {
+            res.setHeader('Cache-Control', 'no-cache');
+          }
+        },
+      }),
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache');
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
@@ -1448,12 +1844,14 @@ async function startServer() {
   });
 
   const gracefulShutdown = (signal: string) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
     structuredLog('INFO', 'graceful_shutdown', { signal });
     clearInterval(heartbeatTimer);
     engine.shutdownTimers();
     wss.close();
     server.close(() => {
-      store.close();
+      store.checkpointAndClose();
       process.exit(0);
     });
   };

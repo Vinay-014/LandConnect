@@ -88,8 +88,20 @@ export interface ChatMessage {
   sender_uuid: string;
   message_type: 'TEXT' | 'SYSTEM';
   body: string;
+  attachment_url?: string;
+  attachment_name?: string;
+  attachment_type?: string;
   delivery_state: MessageDeliveryState;
   read_by_uuids: string[];
+  created_at: string;
+}
+
+export interface ListingReport {
+  id: string;
+  listing_id: string;
+  reporter_uuid: string;
+  reason: string;
+  details: string;
   created_at: string;
 }
 
